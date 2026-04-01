@@ -1,16 +1,19 @@
 include( "shared.lua" )
 
 -- ============================================================
---  CLIENT  – rendering, particles, exhaust
---  Vanilla GMod / HL2 assets ONLY
+--  CLIENT  - Javelin top-attack missile
+--
+--  Particles are emitted from a ParticleEmitter created per-entity.
+--  OnRemove() calls Emitter:Finish() which immediately kills all
+--  in-flight sprites owned by this emitter — prevents ghost smoke.
 -- ============================================================
-
-local matFire = Material( "effects/fire_cloud1" )
 
 local SMOKE_SPRITES = {}
 for i = 1, 9 do
     SMOKE_SPRITES[i] = "particle/smokesprites_000" .. i
 end
+
+local matFire = Material( "effects/fire_cloud1" )
 
 -- ============================================================
 --  Initialize
@@ -34,12 +37,14 @@ end
 function ENT:Draw()
     self:DrawModel()
 
-    if not self.Emitter then
+    -- Recreate emitter if it was somehow lost
+    if not self.Emitter or not self.Emitter:IsValid() then
         self.Emitter  = ParticleEmitter( self:GetPos(), false )
         self.Seed     = math.Rand( 0, 10000 )
         self.Emittime = 0
     end
 
+    -- Rate-limit to once per frame
     if self.Emittime >= CurTime() then return end
     self.Emittime = CurTime()
 
@@ -48,35 +53,37 @@ function ENT:Draw()
     local fwd      = self:GetForward()
     local vel      = self:GetVelocity()
 
-    -- ============================================================
-    --  PRE-IGNITION smoke puff
-    -- ============================================================
+    -- -------------------------------------------------------
+    --  PRE-IGNITION: light ejection smoke
+    -- -------------------------------------------------------
     if not engineOn then
-        local smoke = self.Emitter:Add( SMOKE_SPRITES[ math.random(1,9) ], nozzle )
-        if smoke then
-            smoke:SetVelocity( fwd * -800 )
-            smoke:SetDieTime( math.Rand( 0.9, 1.2 ) )
-            smoke:SetStartAlpha( math.Rand( 40, 70 ) )
-            smoke:SetEndAlpha( 0 )
-            smoke:SetStartSize( math.random( 18, 26 ) )
-            smoke:SetEndSize( math.random( 80, 120 ) )
-            smoke:SetColor( 180, 180, 180 )
-            smoke:SetRoll( math.Rand( 180, 480 ) )
-            smoke:SetRollDelta( math.Rand( -2, 2 ) )
-            smoke:SetGravity( Vector( 0, math.random(1,90), math.random(51,155) ) )
-            smoke:SetAirResistance( 60 )
+        local s = self.Emitter:Add( SMOKE_SPRITES[ math.random(1,9) ], nozzle )
+        if s then
+            s:SetVelocity( fwd * -800 )
+            s:SetDieTime( math.Rand( 0.9, 1.2 ) )
+            s:SetStartAlpha( math.Rand( 40, 70 ) )
+            s:SetEndAlpha( 0 )
+            s:SetStartSize( math.random( 18, 26 ) )
+            s:SetEndSize( math.random( 80, 120 ) )
+            s:SetColor( 180, 180, 180 )
+            s:SetRoll( math.Rand( 180, 480 ) )
+            s:SetRollDelta( math.Rand( -2, 2 ) )
+            s:SetGravity( Vector( 0, math.random(1,90), math.random(51,155) ) )
+            s:SetAirResistance( 60 )
         end
         return
     end
 
-    -- ============================================================
-    --  DYNAMIC ORANGE LIGHT
-    -- ============================================================
+    -- -------------------------------------------------------
+    --  ENGINE ON
+    -- -------------------------------------------------------
+
+    -- Dynamic light
     local dlight = DynamicLight( self:EntIndex() )
     if dlight then
         dlight.Pos        = self:GetPos()
-        dlight.r          = 250 + math.random( -5, 5 )
-        dlight.g          = 170 + math.random( -5, 5 )
+        dlight.r          = 250 + math.random(-5,5)
+        dlight.g          = 170 + math.random(-5,5)
         dlight.b          = 0
         dlight.Brightness = 1.5
         dlight.Decay      = 0.1
@@ -84,75 +91,46 @@ function ENT:Draw()
         dlight.DieTime    = CurTime() + 0.15
     end
 
-    -- ============================================================
-    --  AFTERBURNER FIRE CONE
-    -- ============================================================
-    local fire1 = self.Emitter:Add( "effects/fire_cloud1", nozzle )
-    if fire1 then
-        fire1:SetVelocity( fwd * -10 )
-        fire1:SetDieTime( math.Rand( 0.06, 0.12 ) )
-        fire1:SetStartAlpha( math.Rand( 222, 255 ) )
-        fire1:SetEndAlpha( 0 )
-        fire1:SetStartSize( math.random( 6, 10 ) )
-        fire1:SetEndSize( math.random( 28, 44 ) )
-        fire1:SetAirResistance( 150 )
-        fire1:SetRoll( math.Rand( 180, 480 ) )
-        fire1:SetRollDelta( math.Rand( -3, 3 ) )
-        fire1:SetStartLength( 18 )
-        fire1:SetEndLength( math.Rand( 120, 180 ) )
-        fire1:SetColor( 255, 100, 0 )
+    -- Afterburner fire
+    for _, cfg in ipairs({
+        { mat="effects/fire_cloud1",  smin=6,  smax=10,  emin=28,  emax=44,  r=255, g=100, b=0   },
+        { mat="effects/fire_cloud1",  smin=4,  smax=8,   emin=24,  emax=38,  r=255, g=150, b=0   },
+        { mat="effects/yellowflare",  smin=4,  smax=8,   emin=110, emax=140, r=255, g=200, b=30  },
+    }) do
+        local p = self.Emitter:Add( cfg.mat, nozzle )
+        if p then
+            p:SetVelocity( fwd * -10 )
+            p:SetDieTime( math.Rand( 0.06, 0.12 ) )
+            p:SetStartAlpha( math.Rand( 222, 255 ) )
+            p:SetEndAlpha( 0 )
+            p:SetStartSize( math.random( cfg.smin, cfg.smax ) )
+            p:SetEndSize( math.random( cfg.emin, cfg.emax ) )
+            p:SetAirResistance( 150 )
+            p:SetRoll( math.Rand( 180, 480 ) )
+            p:SetRollDelta( math.Rand( -3, 3 ) )
+            p:SetColor( cfg.r, cfg.g, cfg.b )
+        end
     end
 
-    local fire2 = self.Emitter:Add( "effects/fire_cloud1", nozzle )
-    if fire2 then
-        fire2:SetVelocity( fwd * -10 )
-        fire2:SetDieTime( math.Rand( 0.06, 0.12 ) )
-        fire2:SetStartAlpha( math.Rand( 222, 255 ) )
-        fire2:SetEndAlpha( 0 )
-        fire2:SetStartSize( math.random( 4, 8 ) )
-        fire2:SetEndSize( math.random( 24, 38 ) )
-        fire2:SetAirResistance( 150 )
-        fire2:SetRoll( math.Rand( 180, 480 ) )
-        fire2:SetRollDelta( math.Rand( -3, 3 ) )
-        fire2:SetColor( 255, 150, 0 )
-    end
-
-    local flare = self.Emitter:Add( "effects/yellowflare", nozzle )
-    if flare then
-        flare:SetVelocity( fwd * -10 )
-        flare:SetDieTime( math.Rand( 0.03, 0.06 ) )
-        flare:SetStartAlpha( math.Rand( 222, 255 ) )
-        flare:SetEndAlpha( 0 )
-        flare:SetStartSize( math.random( 4, 8 ) )
-        flare:SetEndSize( math.random( 110, 140 ) )
-        flare:SetAirResistance( 150 )
-        flare:SetRoll( math.Rand( 180, 480 ) )
-        flare:SetRollDelta( math.Rand( -3, 3 ) )
-        flare:SetColor( 255, 200, 30 )
-    end
-
-    -- ============================================================
-    --  SMOKE TRAIL  – fat, black, persistent
-    --  5 sprites/frame, long die time, large end size
-    -- ============================================================
-    for i = 1, 5 do
-        local trail = self.Emitter:Add( SMOKE_SPRITES[ math.random(1,9) ], nozzle )
-        if trail then
-            trail:SetVelocity(
+    -- Black smoke trail (5 sprites per frame, long-lived)
+    for _ = 1, 5 do
+        local t = self.Emitter:Add( SMOKE_SPRITES[ math.random(1,9) ], nozzle )
+        if t then
+            t:SetVelocity(
                 ( vel / 10 ) * -1
                 + Vector( math.Rand(-3,3), math.Rand(-3,3), math.Rand(2,12) )
                 + fwd * -280
             )
-            trail:SetDieTime( math.Rand( 2.5, 4.0 ) )
-            trail:SetStartAlpha( math.Rand( 80, 120 ) )
-            trail:SetEndAlpha( 0 )
-            trail:SetStartSize( math.Rand( 28, 36 ) )
-            trail:SetEndSize( math.Rand( 90, 130 ) )
-            trail:SetRoll( math.Rand( 0, 360 ) )
-            trail:SetRollDelta( math.Rand( -0.8, 0.8 ) )
-            trail:SetColor( 10, 10, 10 )   -- pure black
-            trail:SetAirResistance( 80 )
-            trail:SetGravity(
+            t:SetDieTime( math.Rand( 2.5, 4.0 ) )
+            t:SetStartAlpha( math.Rand( 80, 120 ) )
+            t:SetEndAlpha( 0 )
+            t:SetStartSize( math.Rand( 28, 36 ) )
+            t:SetEndSize( math.Rand( 90, 130 ) )
+            t:SetRoll( math.Rand( 0, 360 ) )
+            t:SetRollDelta( math.Rand( -0.8, 0.8 ) )
+            t:SetColor( 10, 10, 10 )
+            t:SetAirResistance( 80 )
+            t:SetGravity(
                 fwd * -400
                 + VectorRand():GetNormalized() * math.Rand(-100,100)
                 + Vector( 0, 0, math.random(-10,20) )
@@ -160,36 +138,33 @@ function ENT:Draw()
         end
     end
 
-    -- ============================================================
-    --  BEAM EXHAUST  (fire_cloud1 only – always in GMod)
-    -- ============================================================
-    local vOffset = nozzle
-    local vNormal = ( vOffset - self:GetPos() ):GetNormalized()
+    -- Beam exhaust cone
+    local vNormal = ( nozzle - self:GetPos() ):GetNormalized()
     local scroll  = self.Seed + ( CurTime() * -10 )
     local Scale   = 0.5
 
     render.SetMaterial( matFire )
     render.StartBeam( 3 )
-        render.AddBeam( vOffset,                          32*Scale, scroll,     Color(   0,   0, 255, 128 ) )
-        render.AddBeam( vOffset + vNormal * 60  * Scale,  16*Scale, scroll + 1, Color( 255, 255, 255, 128 ) )
-        render.AddBeam( vOffset + vNormal * 148 * Scale,  16*Scale, scroll + 3, Color( 255, 255, 255,   0 ) )
+        render.AddBeam( nozzle,                           32*Scale, scroll,     Color(   0,   0, 255, 128 ) )
+        render.AddBeam( nozzle + vNormal * 60  * Scale,   16*Scale, scroll + 1, Color( 255, 255, 255, 128 ) )
+        render.AddBeam( nozzle + vNormal * 148 * Scale,   16*Scale, scroll + 3, Color( 255, 255, 255,   0 ) )
     render.EndBeam()
 
     scroll = scroll * 1.3
     render.SetMaterial( matFire )
     render.StartBeam( 3 )
-        render.AddBeam( vOffset,                          8*Scale, scroll,     Color(   0,   0, 255, 128 ) )
-        render.AddBeam( vOffset + vNormal * 32  * Scale,  8*Scale, scroll + 1, Color( 255, 255, 255, 128 ) )
-        render.AddBeam( vOffset + vNormal * 108 * Scale,  8*Scale, scroll + 3, Color( 255, 255, 255,   0 ) )
+        render.AddBeam( nozzle,                           8*Scale, scroll,     Color(   0,   0, 255, 128 ) )
+        render.AddBeam( nozzle + vNormal * 32  * Scale,   8*Scale, scroll + 1, Color( 255, 255, 255, 128 ) )
+        render.AddBeam( nozzle + vNormal * 108 * Scale,   8*Scale, scroll + 3, Color( 255, 255, 255,   0 ) )
     render.EndBeam()
 end
 
 -- ============================================================
---  Cleanup
+--  Cleanup  -  MUST call Finish() to kill orphaned sprites
 -- ============================================================
 function ENT:OnRemove()
     if self.Emitter then
-        self.Emitter:Finish()
+        self.Emitter:Finish()  -- kills ALL in-flight particles from this emitter
         self.Emitter = nil
     end
 end
