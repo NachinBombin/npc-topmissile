@@ -5,15 +5,18 @@ include( "shared.lua" )
 -- ============================================================
 --  SERVER  -  NPC Top-Attack Missile
 --
---  Flight path is a 1:1 port of sent_neuro_javelin by Hoffa & Smithy285.
---  Steering: PhysicsUpdate() + LerpAngle() + ApplyForceCenter()
---  Three phases keyed on 2D distance fractions, identical to original.
+--  Flight path: 1:1 port of sent_neuro_javelin (Hoffa & Smithy285)
+--  Steering via PhysicsUpdate() + LerpAngle() + ApplyForceCenter()
 --
---  Fixes vs previous version:
---   1. No bezier / no MOVETYPE_NONE tricks. Pure physics force = same feel.
---   2. phys:Wake() called every PhysicsUpdate tick.
---   3. Ghost smoke: StopParticles() before Remove().
---   4. No-explode: PhysicsCollide guard + timeout.
+--  KEY DIFFERENCE vs the original weapon-fired Javelin:
+--  The original does a violent 108450 u/s soft-launch kick because
+--  it fires from a shoulder-mounted weapon pointing at the sky.
+--  We spawn from an NPC pod at an arbitrary horizontal angle, so
+--  that kick would send it sideways and into a death-spin.
+--
+--  Solution: spawn with zero velocity, nose pointing straight up,
+--  wait 0.75s for ejection smoke, then FireEngine() activates
+--  PhysicsUpdate() which steers from rest.
 -- ============================================================
 
 local SND_LAUNCH  = "weapons/rpg/rocket1.wav"
@@ -36,33 +39,30 @@ function ENT:Initialize()
         self.PhysObj:SetMass( 500 )
         self.PhysObj:EnableDrag( true )
         self.PhysObj:EnableGravity( true )
+        -- Start completely stationary — no kick, no tilt.
+        -- PhysicsUpdate() will accelerate it once FireEngine() fires.
+        self.PhysObj:SetVelocity( Vector( 0, 0, 0 ) )
+        self.PhysObj:SetAngleVelocity( Vector( 0, 0, 0 ) )
     end
+
+    -- Point nose straight up on spawn so the pre-ignition drift
+    -- looks like a real cold-launch ejection, not a horizontal skid.
+    self:SetAngles( Angle( -90, self:GetAngles().y, 0 ) )
 
     -- State
-    self.SpeedValue      = 0
-    self.Speed           = 0
-    self.Destroyed       = false
-    self.ActivatedAlmonds = false   -- engine fired?
-    self.InitialDistance = nil
-    self.Tracking        = false
+    self.SpeedValue           = 0
+    self.Speed                = 0
+    self.Destroyed            = false
+    self.ActivatedAlmonds     = false
+    self.InitialDistance      = nil
+    self.Tracking             = false
     self.UseMovingTargetAiming = false
-    self.SpawnTime       = CurTime()
-    self.HealthVal       = 50
-    self.Damage          = 0
-    self.Radius          = 0
+    self.SpawnTime            = CurTime()
+    self.HealthVal            = 50
+    self.Damage               = 0
+    self.Radius               = 0
 
     self.EngineSound = CreateSound( self, SND_ENGINE )
-
-    -- Soft-launch: tilt 22 deg like original, then kick it upward
-    local a = self:GetAngles()
-    a:RotateAroundAxis( self:GetRight(), 22 )
-    self:SetAngles( a )
-    self:SetPos( self:GetPos() + self:GetRight() * 8 + self:GetForward() * -32 + self:GetUp() * 8 )
-
-    if IsValid( self.PhysObj ) then
-        self.PhysObj:SetVelocityInstantaneous( self:GetForward() * 108450 )
-        self.PhysObj:SetVelocity( self:GetForward() * 108450 )
-    end
 
     sound.Play( SND_LAUNCH, self:GetPos(), 85, 100 )
 
@@ -77,7 +77,7 @@ function ENT:Initialize()
 end
 
 -- ============================================================
---  FireEngine  (called 0.75s after spawn, matches original)
+--  FireEngine  (0.75 s after spawn)
 -- ============================================================
 function ENT:FireEngine()
     if self.Destroyed then return end
@@ -88,7 +88,7 @@ function ENT:FireEngine()
     self.ActivatedAlmonds = true
     self:SetNWBool( "EngineStarted", true )
 
-    -- Invisible prop for scud_trail particle (same as original)
+    -- Invisible prop to carry the scud_trail particle (same as original)
     local a = self:GetAngles()
     a:RotateAroundAxis( self:GetUp(), 180 )
 
@@ -104,7 +104,7 @@ function ENT:FireEngine()
 end
 
 -- ============================================================
---  PhysicsCollide  -  detonate on hard impact
+--  PhysicsCollide
 -- ============================================================
 function ENT:PhysicsCollide( data, physobj )
     if self.Destroyed then return end
@@ -114,17 +114,17 @@ function ENT:PhysicsCollide( data, physobj )
 end
 
 -- ============================================================
---  PhysicsUpdate  -  1:1 copy of sent_neuro_javelin steering
+--  PhysicsUpdate  — 1:1 sent_neuro_javelin steering
 -- ============================================================
 function ENT:PhysicsUpdate()
     if not self.ActivatedAlmonds then return end
 
-    -- Accelerate up to ~2200 u/s (same threshold as original)
+    -- Accelerate up to ~2200 u/s
     if self:GetVelocity():Length() < 2200 then
         self.SpeedValue = self.SpeedValue + 250
     end
 
-    -- Moving-target mode: switch once missile is below target and target is fast
+    -- Switch to moving-target lead if target is fast and missile is below it
     if IsValid( self.TargetEntity ) and not self.UseMovingTargetAiming then
         local zdiff = self:GetPos().z - self.TargetEntity:GetPos().z
         if zdiff < -200 and self.TargetEntity:GetVelocity():Length() > 200 then
@@ -133,13 +133,11 @@ function ENT:PhysicsUpdate()
     end
 
     if self.UseMovingTargetAiming and IsValid( self.TargetEntity ) then
-        -- Lead the moving target, add upward offset scaled by distance
         local dist = ( self.TargetEntity:GetPos() - self:GetPos() ):Length()
-        local pos = self.TargetEntity:GetPos() + Vector( 0, 0, math.Clamp( dist / 5, 0, 2500 ) )
+        local pos  = self.TargetEntity:GetPos() + Vector( 0, 0, math.Clamp( dist / 5, 0, 2500 ) )
         self:SetAngles( LerpAngle( 0.125, self:GetAngles(), ( pos - self:GetPos() ):GetNormalized():Angle() ) )
 
     elseif self.Target then
-        -- Static target: three-phase guidance
         local mp          = self:GetPos()
         local _2dDistance = ( Vector( mp.x, mp.y, 0 ) - Vector( self.Target.x, self.Target.y, 0 ) ):Length()
 
@@ -153,13 +151,10 @@ function ENT:PhysicsUpdate()
         local pos
         if not self.Tracking then
             if _2dDistance > halfway then
-                -- Phase 1: climb
                 pos = self.Target + Vector( 0, 0, 512 )
             elseif _2dDistance > twoThirds then
-                -- Phase 2: apex
                 pos = self.Target + Vector( 0, 0, math.Clamp( self.InitialDistance * 0.85, 0, 14500 ) )
             else
-                -- Phase 3: dive
                 pos = self.Target
                 if IsValid( self.TargetEntity ) then
                     pos = self.TargetEntity:GetPos()
@@ -167,38 +162,28 @@ function ENT:PhysicsUpdate()
                 end
             end
         else
-            if IsValid( self.TargetEntity ) then
-                pos = self.TargetEntity:GetPos()
-            else
-                pos = self.Target
-            end
+            pos = IsValid( self.TargetEntity ) and self.TargetEntity:GetPos() or self.Target
         end
 
-        -- Slow lerp far out, fast lerp up close (original values)
-        local lerpVal = 0.01
-        if _2dDistance < 1000 then lerpVal = 0.1 end
-
+        local lerpVal = _2dDistance < 1000 and 0.1 or 0.01
         self:SetAngles( LerpAngle( lerpVal, self:GetAngles(), ( pos - self:GetPos() ):GetNormalized():Angle() ) )
     end
 
-    -- Drive the missile forward
     self:GetPhysicsObject():ApplyForceCenter( self:GetForward() * self.SpeedValue )
 end
 
 -- ============================================================
---  Think  -  proximity detonate for moving target mode + timeout
+--  Think  — proximity detonate + timeout
 -- ============================================================
 function ENT:Think()
     self:NextThink( CurTime() )
     if self.Destroyed then return true end
 
-    -- Hard timeout
     if CurTime() - self.SpawnTime > 45 then
         self:MissileDoExplosion()
         return true
     end
 
-    -- Moving target proximity check (same as original)
     if self.UseMovingTargetAiming and IsValid( self.TargetEntity ) then
         if ( self:GetPos() - self.TargetEntity:GetPos() ):Length() < self.Radius * 0.65 then
             self:MissileDoExplosion()
@@ -218,16 +203,13 @@ function ENT:OnTakeDamage( dmginfo )
 end
 
 -- ============================================================
---  Explosion  (mirrors MissileDoExplosion from missile_base)
+--  Explosion
 -- ============================================================
 function ENT:MissileDoExplosion()
     if self.Destroyed then return end
     self.Destroyed = true
 
     if self.EngineSound then self.EngineSound:Stop() end
-
-    -- Kill all server particle systems before removing so the
-    -- client gets a clean OnRemove and Emitter:Finish() fires.
     self:StopParticles()
 
     local pos   = self:GetPos()
