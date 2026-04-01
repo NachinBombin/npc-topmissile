@@ -5,23 +5,21 @@ include( "shared.lua" )
 -- ============================================================
 --  SERVER  -  NPC Top-Attack Missile
 --
---  Flight path: 1:1 port of sent_neuro_javelin (Hoffa & Smithy285)
---  Steering via PhysicsUpdate() + LerpAngle() + ApplyForceCenter()
---
---  KEY DIFFERENCE vs the original weapon-fired Javelin:
---  The original does a violent 108450 u/s soft-launch kick because
---  it fires from a shoulder-mounted weapon pointing at the sky.
---  We spawn from an NPC pod at an arbitrary horizontal angle, so
---  that kick would send it sideways and into a death-spin.
---
---  Solution: spawn with zero velocity, nose pointing straight up,
---  wait 0.75s for ejection smoke, then FireEngine() activates
---  PhysicsUpdate() which steers from rest.
+--  Speed logic is a 1:1 match of sent_neuro_javelin (Hoffa & Smithy285):
+--    - SpeedValue starts at 0, ramps +250 per PhysicsUpdate tick
+--    - speedCap = 2300 u/s (multiplayer value from original)
+--    - 108450 u/s initial kick — in the original this fires on Initialize()
+--      from a shoulder weapon already pointing at the sky.
+--      We fire it in FireEngine() (0.75s after spawn) once the nose
+--      is already pointing straight up, so the kick goes upward cleanly
+--      instead of sideways.
 -- ============================================================
 
 local SND_LAUNCH  = "weapons/rpg/rocket1.wav"
 local SND_ENGINE  = "vehicles/combine_apc/apc_rocket_launch1.wav"
 local SND_EXPLODE = "ambient/explosions/explode_8.wav"
+
+local speedCap = game.SinglePlayer() and 1800 or 2300  -- exact from original
 
 -- ============================================================
 --  Initialize
@@ -36,31 +34,29 @@ function ENT:Initialize()
     self.PhysObj = self:GetPhysicsObject()
     if IsValid( self.PhysObj ) then
         self.PhysObj:Wake()
-        self.PhysObj:SetMass( 500 )
+        self.PhysObj:SetMass( 500 )  -- exact from original
         self.PhysObj:EnableDrag( true )
         self.PhysObj:EnableGravity( true )
-        -- Start completely stationary — no kick, no tilt.
-        -- PhysicsUpdate() will accelerate it once FireEngine() fires.
+        -- Start stationary; the 108450 kick fires in FireEngine() below.
         self.PhysObj:SetVelocity( Vector( 0, 0, 0 ) )
         self.PhysObj:SetAngleVelocity( Vector( 0, 0, 0 ) )
     end
 
-    -- Point nose straight up on spawn so the pre-ignition drift
-    -- looks like a real cold-launch ejection, not a horizontal skid.
+    -- Point nose straight up so the 108450 kick goes upward, not sideways.
     self:SetAngles( Angle( -90, self:GetAngles().y, 0 ) )
 
-    -- State
-    self.SpeedValue           = 0
-    self.Speed                = 0
-    self.Destroyed            = false
-    self.ActivatedAlmonds     = false
-    self.InitialDistance      = nil
-    self.Tracking             = false
+    -- State (exact field names from original)
+    self.SpeedValue            = 0
+    self.Speed                 = 0
+    self.Destroyed             = false
+    self.ActivatedAlmonds      = false
+    self.InitialDistance       = nil
+    self.Tracking              = false
     self.UseMovingTargetAiming = false
-    self.SpawnTime            = CurTime()
-    self.HealthVal            = 50
-    self.Damage               = 0
-    self.Radius               = 0
+    self.SpawnTime             = CurTime()
+    self.HealthVal             = 50   -- exact from original
+    self.Damage                = 0
+    self.Radius                = 0
 
     self.EngineSound = CreateSound( self, SND_ENGINE )
 
@@ -78,17 +74,26 @@ end
 
 -- ============================================================
 --  FireEngine  (0.75 s after spawn)
+--  Applies the same 108450 u/s kick the original fires on spawn,
+--  but deferred so the nose is already pointing up.
 -- ============================================================
 function ENT:FireEngine()
     if self.Destroyed then return end
 
-    self.Damage = math.random( 2500, 4500 )
-    self.Radius = math.random( 512, 760 )
+    self.Damage = math.random( 2500, 4500 )   -- exact from original
+    self.Radius = math.random( 512, 760 )     -- exact from original
     self.EngineSound:PlayEx( 511, 100 )
     self.ActivatedAlmonds = true
     self:SetNWBool( "EngineStarted", true )
 
-    -- Invisible prop to carry the scud_trail particle (same as original)
+    -- 108450 kick — identical value to the original, now firing upward
+    local phys = self:GetPhysicsObject()
+    if IsValid( phys ) then
+        phys:SetVelocityInstantaneous( self:GetForward() * 108450 )
+        phys:SetVelocity( self:GetForward() * 108450 )
+    end
+
+    -- Invisible prop to carry the scud_trail particle (exact from original)
     local a = self:GetAngles()
     a:RotateAroundAxis( self:GetUp(), 180 )
 
@@ -114,20 +119,22 @@ function ENT:PhysicsCollide( data, physobj )
 end
 
 -- ============================================================
---  PhysicsUpdate  — 1:1 sent_neuro_javelin steering
+--  PhysicsUpdate  — exact Javelin steering + exact speed values
 -- ============================================================
 function ENT:PhysicsUpdate()
     if not self.ActivatedAlmonds then return end
+    if not self.Target then return end
 
-    -- Accelerate up to ~2200 u/s
-    if self:GetVelocity():Length() < 2200 then
+    -- Exact ramp from original: +250 per tick up to speedCap
+    if self:GetVelocity():Length() < speedCap then
         self.SpeedValue = self.SpeedValue + 250
     end
 
-    -- Switch to moving-target lead if target is fast and missile is below it
+    -- Moving-target lead switch (exact from original)
     if IsValid( self.TargetEntity ) and not self.UseMovingTargetAiming then
-        local zdiff = self:GetPos().z - self.TargetEntity:GetPos().z
-        if zdiff < -200 and self.TargetEntity:GetVelocity():Length() > 200 then
+        local zdiff  = self:GetPos().z - self.TargetEntity:GetPos().z
+        local tspeed = self.TargetEntity:GetVelocity():Length()
+        if zdiff < -200 and tspeed > 200 then
             self.UseMovingTargetAiming = true
         end
     end
@@ -137,24 +144,23 @@ function ENT:PhysicsUpdate()
         local pos  = self.TargetEntity:GetPos() + Vector( 0, 0, math.Clamp( dist / 5, 0, 2500 ) )
         self:SetAngles( LerpAngle( 0.125, self:GetAngles(), ( pos - self:GetPos() ):GetNormalized():Angle() ) )
 
-    elseif self.Target then
+    else
         local mp          = self:GetPos()
         local _2dDistance = ( Vector( mp.x, mp.y, 0 ) - Vector( self.Target.x, self.Target.y, 0 ) ):Length()
 
-        if not self.InitialDistance then
-            self.InitialDistance = _2dDistance
-        end
+        if not self.InitialDistance then self.InitialDistance = _2dDistance end
 
         local halfway   = self.InitialDistance * 0.9
         local twoThirds = self.InitialDistance * 0.4
 
-        local pos
+        local pos = self.Target
+
         if not self.Tracking then
             if _2dDistance > halfway then
                 pos = self.Target + Vector( 0, 0, 512 )
-            elseif _2dDistance > twoThirds then
+            elseif _2dDistance < halfway and _2dDistance > twoThirds then
                 pos = self.Target + Vector( 0, 0, math.Clamp( self.InitialDistance * 0.85, 0, 14500 ) )
-            else
+            elseif _2dDistance < twoThirds then
                 pos = self.Target
                 if IsValid( self.TargetEntity ) then
                     pos = self.TargetEntity:GetPos()
@@ -162,7 +168,9 @@ function ENT:PhysicsUpdate()
                 end
             end
         else
-            pos = IsValid( self.TargetEntity ) and self.TargetEntity:GetPos() or self.Target
+            if IsValid( self.TargetEntity ) then
+                pos = self.TargetEntity:GetPos()
+            end
         end
 
         local lerpVal = _2dDistance < 1000 and 0.1 or 0.01
