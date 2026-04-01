@@ -8,16 +8,16 @@ include( "shared.lua" )
 --  immediately kills all in-flight sprites from this emitter.
 -- ============================================================
 
-local matHeatWave = Material( "sprites/heat_shimmer" )  -- vanilla fallback (bf4_heatwave may not exist)
+local matHeatWave = Material( "sprites/heat_shimmer" )  -- vanilla fallback
 local matFire     = Material( "effects/fire_cloud1" )
 
 ENT.NozzlePos = Vector( -12, 0, 0 )
 
 function ENT:Initialize()
     self:SetRenderMode( RENDERMODE_NORMAL )
-    local pos = self:LocalToWorld( self.NozzlePos )
-    self.Emitter  = ParticleEmitter( pos, false )
-    self.Seed     = math.Rand( 0, 10000 )
+    local pos    = self:LocalToWorld( self.NozzlePos )
+    self.Emitter = ParticleEmitter( pos, false )
+    self.Seed    = math.Rand( 0, 10000 )
     self.Emittime = 0
     self.OnStart  = CurTime()
 end
@@ -33,14 +33,16 @@ end
 function ENT:Draw()
     self:DrawModel()
 
+    -- Recreate emitter if somehow lost
     if not self.Emitter or not self.Emitter:IsValid() then
-        local pos = self:LocalToWorld( self.NozzlePos )
+        local pos    = self:LocalToWorld( self.NozzlePos )
         self.Emitter = ParticleEmitter( pos, false )
         self.Seed    = math.Rand( 0, 10000 )
         self.OnStart = CurTime()
     end
 
     if not self.Emittime then self.Emittime = 0 end
+    -- Throttle to one particle batch per frame at most
     if self.Emittime >= CurTime() then return end
     self.Emittime = CurTime()
 
@@ -48,7 +50,8 @@ function ENT:Draw()
     local nozzle   = self:LocalToWorld( self.NozzlePos )
 
     -- -------------------------------------------------------
-    --  PRE-IGNITION smoke  (exact from sent_neuro_javelin)
+    --  PRE-IGNITION smoke  (0.75 s window before FireEngine)
+    --  Exact copy from sent_neuro_javelin
     -- -------------------------------------------------------
     if not engineOn then
         local smoke = self.Emitter:Add( "effects/smoke_a", nozzle )
@@ -68,10 +71,10 @@ function ENT:Draw()
     end
 
     -- -------------------------------------------------------
-    --  ENGINE ON: MissileEffectDraw_fire() exact copy
+    --  ENGINE ON  —  MissileEffectDraw_fire() exact copy
     -- -------------------------------------------------------
 
-    -- Dynamic light (from sent_neuro_javelin)
+    -- Dynamic light
     local dlight = DynamicLight( self:EntIndex() )
     if dlight then
         local c = Color( 250 + math.random(-5,5), 170 + math.random(-5,5), 0, 100 )
@@ -85,7 +88,7 @@ function ENT:Draw()
         dlight.DieTime    = CurTime() + 0.15
     end
 
-    -- 3 smoke trail sprites (exact from MissileEffectDraw_fire)
+    -- 3 smoke trail sprites
     for i = 1, 3 do
         local particle = self.Emitter:Add(
             "particle/smokesprites_000" .. math.random( 1, 9 ), nozzle
@@ -117,9 +120,7 @@ function ENT:Draw()
         end
     end
 
-    -- -------------------------------------------------------
-    --  Beam exhaust  (exact from MissileEffectDraw_fire)
-    -- -------------------------------------------------------
+    -- Beam exhaust
     local vOffset = nozzle
     local vNormal = ( vOffset - self:GetPos() ):GetNormalized()
     local scroll  = self.Seed + ( CurTime() * -10 )
