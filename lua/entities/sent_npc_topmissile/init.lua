@@ -3,199 +3,241 @@ AddCSLuaFile( "shared.lua" )
 include( "shared.lua" )
 
 -- ============================================================
---  SERVER  -  NPC Top-Attack Missile
+--  SERVER  -  NPC Top-Attack Missile  (Javelin LOBL static-point mode)
 --
---  Navigation model: pre-baked quadratic bezier arc.
---  At FireEngine() we compute three control points once:
---    P0 = missile world position at ignition
---    P1 = apex  (midpoint XY, elevated above both endpoints)
---    P2 = fixed ground target (set by Gekko, NEVER updated again)
+--  Physics model: MOVETYPE_VPHYSICS (gravity OFF, drag OFF)
+--  This matches obj_vj_projectile_base exactly.
+--  Velocity is applied via phys:SetVelocity(), NOT self:SetVelocity().
+--  Orientation is applied via self:SetAngles() each tick.
 --
---  Each Think() tick we advance a scalar t (0->1) and aim the
---  missile at the NEXT point on the arc.  No LerpAngle fighting,
---  no phases, no tracking, no jitter.
---
---  Speed is intentionally capped at 100 u/s so the arc is visible.
+--  Navigation: pre-baked quadratic bezier arc, computed ONCE at
+--  FireEngine() from the enemy ground position frozen at launch.
+--  t advances using real FrameTime() so speed is frame-rate independent.
+--  No lookahead spiral possible: we aim at the TANGENT of the arc,
+--  not at a future point, so the direction is always mathematically
+--  consistent with the current velocity.
 -- ============================================================
 
 ENT.HealthVal = 30
 ENT.Damage    = 0
 ENT.Radius    = 0
-ENT.Destroyed = false
+ENT.Dead      = false   -- mirrors VJ base naming to avoid double-fire
 
-local SPEED_LAUNCH  = 60     -- initial coast speed before engine fires
-local SPEED_MAX     = 100    -- absolute cap (units/s)
-local SPEED_ACCEL   = 4      -- units/s per Think tick
+-- Speed constants (units/s)
+local SPEED_BOOST  = 80    -- ejection boost before engine fires (low, upward)
+local SPEED_CRUISE = 100   -- engine-on cruise speed (hard cap)
+local SPEED_ACCEL  = 120   -- units/s^2 acceleration after engine fires
 
--- Apex lift: how high above the midpoint we push P1.
--- Expressed as a fraction of the horizontal distance.
-local APEX_FRAC     = 0.7
-local APEX_MIN      = 350
-local APEX_MAX      = 900
+-- Apex: P1 is lifted above the P0-P2 midpoint by (hDist * FRAC) clamped.
+local APEX_FRAC = 0.55
+local APEX_MIN  = 300
+local APEX_MAX  = 800
 
--- How far ahead on the arc we aim each tick (0-1, smaller = tighter)
-local LOOKAHEAD     = 0.04
-
+-- Sounds
 local SND_LAUNCH  = "weapons/rpg/rocket1.wav"
-local SND_EXPLODE = "weapons/explode3.wav"
-local SND_WHOOSH  = "vehicles/combine_apc/apc_rocket_launch1.wav"
+local SND_ENGINE  = "vehicles/combine_apc/apc_rocket_launch1.wav"
+local SND_EXPLODE = "ambient/explosions/explode_8.wav"
 
 -- ============================================================
---  Bezier helpers
+--  Quadratic bezier
+--    B(t) = (1-t)^2*P0 + 2(1-t)*t*P1 + t^2*P2
+--  Tangent (direction of motion at t):
+--    B'(t) = 2(1-t)*(P1-P0) + 2t*(P2-P1)
 -- ============================================================
-local function BezierPoint( p0, p1, p2, t )
-    -- quadratic bezier: B(t) = (1-t)^2*P0 + 2(1-t)t*P1 + t^2*P2
+local function BezierPos( p0, p1, p2, t )
     local u = 1 - t
-    return p0 * (u * u) + p1 * (2 * u * t) + p2 * (t * t)
+    return p0*(u*u) + p1*(2*u*t) + p2*(t*t)
+end
+
+local function BezierTangent( p0, p1, p2, t )
+    -- Returns the un-normalised tangent vector
+    return (p1 - p0) * (2*(1-t)) + (p2 - p1) * (2*t)
 end
 
 -- ============================================================
 --  Initialize
 -- ============================================================
 function ENT:Initialize()
-    self:SetModel( "models/weapons/w_missile.mdl" )
-    self:SetMoveType( MOVETYPE_FLY )
+    self:SetModel( "models/weapons/w_missile_launch.mdl" )  -- same as obj_vj_rocket
     self:SetSolid( SOLID_BBOX )
     self:SetCollisionGroup( COLLISION_GROUP_PROJECTILE )
-    self:SetCollisionBounds( Vector( -4, -4, -4 ), Vector( 4, 4, 4 ) )
 
-    self.Destroyed  = false
+    -- VPHYSICS is the correct movetype for VJ projectiles.
+    -- It gives us a real physics object so phys:SetVelocity works properly.
+    if not self:PhysicsInit( MOVETYPE_VPHYSICS ) then
+        -- Fallback: sphere collider if model has no phys mesh
+        self:PhysicsInitSphere( 4, "metal_bouncy" )
+    end
+    self:SetMoveType( MOVETYPE_VPHYSICS )
+    self:SetMoveCollide( MOVECOLLIDE_FLY_BOUNCE )
+
+    local phys = self:GetPhysicsObject()
+    if IsValid( phys ) then
+        phys:Wake()
+        phys:SetMass( 1 )
+        phys:EnableGravity( false )   -- we control all motion manually
+        phys:EnableDrag( false )
+        phys:SetBuoyancyRatio( 0 )
+    end
+
+    -- Helpers prevent projectile appearing inside the NPC
+    self:AddEFlags( EFL_DONTBLOCKLOS )
+    self:AddEFlags( EFL_DONTWALKON )
+    self:AddSolidFlags( FSOLID_NOT_STANDABLE )
+
+    -- State
+    self.Dead       = false
     self.ArcReady   = false
-    self.ArcT       = 0       -- current position on the arc (0 -> 1)
-    self.Speed      = SPEED_LAUNCH
+    self.ArcT       = 0
+    self.Speed      = SPEED_BOOST
     self.SpawnTime  = CurTime()
+    self.ArcP0      = nil
+    self.ArcP1      = nil
+    self.ArcP2      = nil
 
-    -- Arc control points (set in FireEngine)
-    self.ArcP0 = nil
-    self.ArcP1 = nil
-    self.ArcP2 = nil
+    self.EngineSound = CreateSound( self, SND_ENGINE )
 
-    self.EngineSound = CreateSound( self, SND_WHOOSH )
+    -- Ejection: tilt upward ~25 deg and give a slow boost so it clears the mech.
+    -- We apply via phys so the movetype is consistent from frame 1.
+    local fwd = self:GetForward()
+    -- Tilt the spawn angle upward
+    local spawnAng = self:GetAngles()
+    spawnAng.pitch = spawnAng.pitch - 25   -- negative pitch = nose up in GMod
+    self:SetAngles( spawnAng )
 
-    -- Tilt upward 20 deg on spawn so it doesn't immediately nosedive
-    local a = self:GetAngles()
-    a:RotateAroundAxis( self:GetRight(), 20 )
-    self:SetAngles( a )
-    self:SetVelocity( self:GetForward() * SPEED_LAUNCH )
+    local ejectionDir = self:GetForward()  -- re-read after angle change
+    if IsValid( phys ) then
+        phys:SetVelocity( ejectionDir * SPEED_BOOST )
+    end
 
-    sound.Play( SND_LAUNCH, self:GetPos(), 90, 100 )
+    sound.Play( SND_LAUNCH, self:GetPos(), 85, 100 )
 
+    -- Fire engine after 0.5 s (Javelin soft-launch delay)
     local selfRef = self
-    timer.Simple( 0.6, function()
-        if not IsValid( selfRef ) then return end
-        selfRef:FireEngine()
+    timer.Simple( 0.5, function()
+        if IsValid( selfRef ) and not selfRef.Dead then
+            selfRef:FireEngine()
+        end
     end )
 
     self:NextThink( CurTime() )
 end
 
 -- ============================================================
---  Touch
+--  Touch / StartTouch  -  collision
 -- ============================================================
-function ENT:Touch( other )
-    if self.Destroyed then return end
-    if IsValid( other ) and other == self.Owner then return end
+function ENT:PhysicsCollide( data, phys )
+    if self.Dead then return end
+    -- Ignore our own owner
+    local owner = self:GetOwner()
+    if IsValid( owner ) and data.HitEntity == owner then return end
+    self:DoExplosion()
+end
 
-    -- ignore sky brush
-    if other:IsWorld() then
-        local tr = util.TraceLine({
-            start  = self:GetPos(),
-            endpos = self:GetPos() + Vector( 0, 0, 64 ),
-            filter = self,
-            mask   = MASK_SOLID,
-        })
-        if tr.HitSky then return end
-    end
-
+function ENT:StartTouch( ent )
+    if self.Dead then return end
+    local owner = self:GetOwner()
+    if IsValid( owner ) and ent == owner then return end
     self:DoExplosion()
 end
 
 -- ============================================================
---  FireEngine  -  compute arc once, never touch Target again
+--  FireEngine  -  bake arc once, zero Target references after
 -- ============================================================
 function ENT:FireEngine()
+    if self.Dead then return end
+
     self.Damage = math.random( 2500, 4500 )
     self.Radius = math.random( 512,  760 )
     self:SetNWBool( "EngineStarted", true )
-    self.EngineSound:PlayEx( 90, 100 )
+    self.EngineSound:PlayEx( 85, 100 )
 
     if not self.Target then
-        -- No target set by spawner — just fly straight and self-destruct
+        -- No target: just cruise straight and time-out naturally
         self.ArcReady = false
         return
     end
 
-    -- P0: where the missile is right now
-    local p0 = self:GetPos()
+    local p0 = self:GetPos()                                      -- current missile pos
+    local p2 = Vector( self.Target.x, self.Target.y, self.Target.z )  -- fixed ground target
 
-    -- P2: the fixed ground target, locked forever
-    local p2 = Vector( self.Target.x, self.Target.y, self.Target.z )
-
-    -- P1: apex — midpoint XY, lifted by APEX_FRAC * horizontal distance
-    local hDist      = ( p0 - p2 ):Length2D()
+    local hDist      = ( Vector(p0.x, p0.y, 0) - Vector(p2.x, p2.y, 0) ):Length()
     local apexHeight = math.Clamp( hDist * APEX_FRAC, APEX_MIN, APEX_MAX )
-    local midXY      = ( p0 + p2 ) * 0.5
-    local p1         = Vector( midXY.x, midXY.y, math.max( p0.z, p2.z ) + apexHeight )
+    local midX       = ( p0.x + p2.x ) * 0.5
+    local midY       = ( p0.y + p2.y ) * 0.5
+    local baseZ      = math.max( p0.z, p2.z )
 
     self.ArcP0    = p0
-    self.ArcP1    = p1
+    self.ArcP1    = Vector( midX, midY, baseZ + apexHeight )
     self.ArcP2    = p2
     self.ArcT     = 0
     self.ArcReady = true
-
-    -- Null out Target so nothing can accidentally re-read/update it
-    self.Target = nil
+    self.Target   = nil   -- lock: no re-targeting ever
 
     print( string.format(
-        "[TopMissile] Arc baked | hDist=%.0f apex=%.0f P0=%s P1=%s P2=%s",
-        hDist, apexHeight, tostring(p0), tostring(p1), tostring(p2)
+        "[TopMissile] Arc baked | hDist=%.0f apexZ=%.0f P0=%s P1=%s P2=%s",
+        hDist, baseZ + apexHeight,
+        tostring( self.ArcP0 ), tostring( self.ArcP1 ), tostring( self.ArcP2 )
     ))
 end
 
 -- ============================================================
---  Think  -  advance along pre-baked arc
+--  Think  -  advance missile along baked arc each frame
 -- ============================================================
 function ENT:Think()
     self:NextThink( CurTime() )
-    if self.Destroyed then return true end
+    if self.Dead then return true end
 
-    -- safety timeout
-    if CurTime() - self.SpawnTime > 60 then
+    -- Hard timeout
+    if CurTime() - self.SpawnTime > 45 then
         self:DoExplosion()
         return true
     end
 
-    -- before arc is ready, coast forward
+    local phys = self:GetPhysicsObject()
+    if not IsValid( phys ) then return true end
+
+    -- Pre-engine coast: just keep flying in current direction
     if not self.ArcReady then
-        self:SetVelocity( self:GetForward() * self.Speed )
+        phys:SetVelocity( self:GetForward() * self.Speed )
         return true
     end
 
-    -- accelerate up to cap
-    if self.Speed < SPEED_MAX then
-        self.Speed = math.min( self.Speed + SPEED_ACCEL, SPEED_MAX )
+    -- -------------------------------------------------------
+    --  Arc navigation
+    -- -------------------------------------------------------
+    local dt = FrameTime()   -- real server frame delta (avoids 1/66 assumption)
+
+    -- Accelerate smoothly up to cruise speed
+    self.Speed = math.min( self.Speed + SPEED_ACCEL * dt, SPEED_CRUISE )
+
+    -- Estimate arc length once (first tick after engine fires)
+    if not self.ArcLength then
+        -- Approximate arc length with 20-sample sum
+        local len = 0
+        local prev = self.ArcP0
+        for i = 1, 20 do
+            local next = BezierPos( self.ArcP0, self.ArcP1, self.ArcP2, i / 20 )
+            len = len + ( next - prev ):Length()
+            prev = next
+        end
+        self.ArcLength = math.max( len, 1 )
     end
 
-    local mp = self:GetPos()
+    -- Advance t proportionally: speed(u/s) / arcLen(u) * dt(s) = fraction of arc per frame
+    self.ArcT = math.min( self.ArcT + ( self.Speed / self.ArcLength ) * dt, 1 )
 
-    -- Advance t by how far we moved as a fraction of total arc length.
-    -- Approximate arc length as |P2 - P0| (good enough for guidance).
-    local approxLen = ( self.ArcP2 - self.ArcP0 ):Length()
-    if approxLen < 1 then approxLen = 1 end
-    local dt = self.Speed / approxLen   -- fraction of arc covered this tick (1 tick ~= 1/66 s but we don't divide by tick rate; speed is low enough)
-    self.ArcT = math.min( self.ArcT + dt * (1/66), 1 )
+    -- Aim direction = exact TANGENT of the bezier at current t
+    -- This guarantees velocity is always tangent to the curve: no spirals.
+    local tangent = BezierTangent( self.ArcP0, self.ArcP1, self.ArcP2, self.ArcT )
+    if tangent:LengthSqr() < 0.001 then return true end  -- degenerate, skip
 
-    -- lookahead point on the arc
-    local lookT   = math.min( self.ArcT + LOOKAHEAD, 1 )
-    local aimPos  = BezierPoint( self.ArcP0, self.ArcP1, self.ArcP2, lookT )
-
-    -- point nose directly at lookahead (no LerpAngle — arc is smooth enough)
-    local dir = ( aimPos - mp ):GetNormalized()
+    local dir = tangent:GetNormalized()
     self:SetAngles( dir:Angle() )
-    self:SetVelocity( dir * self.Speed )
+    phys:SetVelocity( dir * self.Speed )
 
-    -- explode when we reach the end of the arc
-    if self.ArcT >= 0.98 then
+    -- Detonate when arc is complete
+    if self.ArcT >= 0.99 then
         self:DoExplosion()
     end
 
@@ -206,7 +248,7 @@ end
 --  Damage
 -- ============================================================
 function ENT:OnTakeDamage( dmginfo )
-    if self.Destroyed then return end
+    if self.Dead then return end
     self.HealthVal = self.HealthVal - dmginfo:GetDamage()
     if self.HealthVal <= 0 then self:DoExplosion() end
 end
@@ -215,41 +257,41 @@ end
 --  Explosion
 -- ============================================================
 function ENT:DoExplosion()
-    if self.Destroyed then return end
-    self.Destroyed = true
+    if self.Dead then return end
+    self.Dead = true
 
+    local pos    = self:GetPos()
     local dmg    = self.Damage > 0 and self.Damage or 1200
     local radius = self.Radius > 0 and self.Radius or 512
-    local pos    = self:GetPos()
     local owner  = IsValid( self.Owner ) and self.Owner or self
 
     if self.EngineSound then self.EngineSound:Stop() end
 
     sound.Play( SND_EXPLODE, pos, 100, 100 )
+    util.ScreenShake( pos, 16, 200, 1, 3000 )
+
+    -- VJ-style explosion effect
+    local ang = Angle(0,0,0)
+    ParticleEffect( "vj_explosion3",       pos, ang )
+    ParticleEffect( "vj_rocket_idle1",     pos, ang )  -- brief trail burst
 
     local ed = EffectData()
     ed:SetOrigin( pos )
-    ed:SetMagnitude( radius )
-    ed:SetScale( 1 )
-    ed:SetRadius( radius )
-    util.Effect( "Explosion", ed )
+    util.Effect( "VJ_Small_Explosion1", ed )
 
-    ParticleEffect( "explosion_huge",      pos, self:GetAngles(), nil )
-    ParticleEffect( "weapon_muzzle_smoke", pos, self:GetAngles(), nil )
-
+    -- Physics shockwave
     local pe = ents.Create( "env_physexplosion" )
     if IsValid( pe ) then
         pe:SetPos( pos )
         pe:SetKeyValue( "Magnitude",  tostring( math.floor( dmg * 0.5 ) ) )
         pe:SetKeyValue( "radius",     tostring( radius ) )
         pe:SetKeyValue( "spawnflags", "19" )
-        pe:Spawn()
-        pe:Activate()
+        pe:Spawn() pe:Activate()
         pe:Fire( "Explode", "", 0 )
         pe:Fire( "Kill",    "", 0.5 )
     end
 
-    util.BlastDamage( self, owner, pos + Vector( 0, 0, 50 ), radius, dmg )
+    util.BlastDamage( self, owner, pos + Vector(0,0,50), radius, dmg )
     self:Remove()
 end
 
@@ -257,5 +299,6 @@ end
 --  Cleanup
 -- ============================================================
 function ENT:OnRemove()
+    self.Dead = true
     if self.EngineSound then self.EngineSound:Stop() end
 end
