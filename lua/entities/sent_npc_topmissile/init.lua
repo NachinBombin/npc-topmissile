@@ -3,74 +3,85 @@ AddCSLuaFile( "shared.lua" )
 include( "shared.lua" )
 
 -- ============================================================
---  SERVER  - NPC Top-Attack Terror Missile
---  MOVETYPE_FLY  |  Touch() detonation  |  Think() guidance
+--  SERVER  -  NPC Top-Attack Missile
 --
---  GUIDANCE PHASES (timed from engine ignition):
---    Phase 1  0.0 - 1.5s : CLIMB  - aim straight up from current pos
---                          NO lateral steering whatsoever
---    Phase 2  1.5 - 3.5s : ARC    - aim at Target XY + apexHeight
---                          missile arcs forward and over
---    Phase 3  3.5s+      : DIVE   - aim straight at Target
+--  Navigation model: pre-baked quadratic bezier arc.
+--  At FireEngine() we compute three control points once:
+--    P0 = missile world position at ignition
+--    P1 = apex  (midpoint XY, elevated above both endpoints)
+--    P2 = fixed ground target (set by Gekko, NEVER updated again)
+--
+--  Each Think() tick we advance a scalar t (0->1) and aim the
+--  missile at the NEXT point on the arc.  No LerpAngle fighting,
+--  no phases, no tracking, no jitter.
+--
+--  Speed is intentionally capped at 100 u/s so the arc is visible.
 -- ============================================================
 
-ENT.HealthVal  = 30
-ENT.Damage     = 0
-ENT.Radius     = 0
-ENT.Destroyed  = false
+ENT.HealthVal = 30
+ENT.Damage    = 0
+ENT.Radius    = 0
+ENT.Destroyed = false
 
-local JITTER_MAX     = 50
+local SPEED_LAUNCH  = 60     -- initial coast speed before engine fires
+local SPEED_MAX     = 100    -- absolute cap (units/s)
+local SPEED_ACCEL   = 4      -- units/s per Think tick
 
-local SPEED_LAUNCH   = 200
-local SPEED_MAX      = 450
-local SPEED_ACCEL    = 6
+-- Apex lift: how high above the midpoint we push P1.
+-- Expressed as a fraction of the horizontal distance.
+local APEX_FRAC     = 0.7
+local APEX_MIN      = 350
+local APEX_MAX      = 900
 
-local STEER_FAR      = 0.06
-local STEER_NEAR     = 0.18
-local NEAR_THRESHOLD = 600
+-- How far ahead on the arc we aim each tick (0-1, smaller = tighter)
+local LOOKAHEAD     = 0.04
 
-local PHASE1_END     = 1.5
-local PHASE2_END     = 3.5
-local APEX_MIN       = 400
-local APEX_MAX       = 1200
-local CEIL_MARGIN    = 600
+local SND_LAUNCH  = "weapons/rpg/rocket1.wav"
+local SND_EXPLODE = "weapons/explode3.wav"
+local SND_WHOOSH  = "vehicles/combine_apc/apc_rocket_launch1.wav"
 
-local SND_LAUNCH     = "weapons/rpg/rocket1.wav"
-local SND_EXPLODE    = "weapons/explode3.wav"
-local SND_WHOOSH     = "vehicles/combine_apc/apc_rocket_launch1.wav"
+-- ============================================================
+--  Bezier helpers
+-- ============================================================
+local function BezierPoint( p0, p1, p2, t )
+    -- quadratic bezier: B(t) = (1-t)^2*P0 + 2(1-t)t*P1 + t^2*P2
+    local u = 1 - t
+    return p0 * (u * u) + p1 * (2 * u * t) + p2 * (t * t)
+end
 
 -- ============================================================
 --  Initialize
 -- ============================================================
 function ENT:Initialize()
     self:SetModel( "models/weapons/w_missile.mdl" )
-
     self:SetMoveType( MOVETYPE_FLY )
     self:SetSolid( SOLID_BBOX )
     self:SetCollisionGroup( COLLISION_GROUP_PROJECTILE )
     self:SetCollisionBounds( Vector( -4, -4, -4 ), Vector( 4, 4, 4 ) )
 
-    self.Destroyed        = false
-    self.ActivatedAlmonds = false
-    self.Speed            = SPEED_LAUNCH
-    self.SpawnTime        = CurTime()
-    self.EngineTime       = nil
-    self.ApexZ            = nil   -- target.z + apexHeight, set at ignition
-    self.CeilLimit        = nil
+    self.Destroyed  = false
+    self.ArcReady   = false
+    self.ArcT       = 0       -- current position on the arc (0 -> 1)
+    self.Speed      = SPEED_LAUNCH
+    self.SpawnTime  = CurTime()
+
+    -- Arc control points (set in FireEngine)
+    self.ArcP0 = nil
+    self.ArcP1 = nil
+    self.ArcP2 = nil
 
     self.EngineSound = CreateSound( self, SND_WHOOSH )
 
-    -- soft-loft 22 deg upward
+    -- Tilt upward 20 deg on spawn so it doesn't immediately nosedive
     local a = self:GetAngles()
-    a:RotateAroundAxis( self:GetRight(), 22 )
+    a:RotateAroundAxis( self:GetRight(), 20 )
     self:SetAngles( a )
-    self:SetPos( self:GetPos() + self:GetUp() * 32 )
     self:SetVelocity( self:GetForward() * SPEED_LAUNCH )
 
     sound.Play( SND_LAUNCH, self:GetPos(), 90, 100 )
 
     local selfRef = self
-    timer.Simple( 0.75, function()
+    timer.Simple( 0.6, function()
         if not IsValid( selfRef ) then return end
         selfRef:FireEngine()
     end )
@@ -79,19 +90,20 @@ function ENT:Initialize()
 end
 
 -- ============================================================
---  Touch  - ignore owner, ignore sky
+--  Touch
 -- ============================================================
 function ENT:Touch( other )
     if self.Destroyed then return end
     if IsValid( other ) and other == self.Owner then return end
 
+    -- ignore sky brush
     if other:IsWorld() then
-        local tr = util.TraceLine( {
+        local tr = util.TraceLine({
             start  = self:GetPos(),
             endpos = self:GetPos() + Vector( 0, 0, 64 ),
             filter = self,
             mask   = MASK_SOLID,
-        } )
+        })
         if tr.HitSky then return end
     end
 
@@ -99,97 +111,93 @@ function ENT:Touch( other )
 end
 
 -- ============================================================
---  FireEngine  - ignition, tiny jitter, apex setup
+--  FireEngine  -  compute arc once, never touch Target again
 -- ============================================================
 function ENT:FireEngine()
-    self.Damage           = math.random( 2500, 4500 )
-    self.Radius           = math.random( 512,  760 )
-    self.ActivatedAlmonds = true
-    self.EngineTime       = CurTime()
+    self.Damage = math.random( 2500, 4500 )
+    self.Radius = math.random( 512,  760 )
     self:SetNWBool( "EngineStarted", true )
     self.EngineSound:PlayEx( 90, 100 )
 
-    if self.Target then
-        -- tiny jitter - XY only, no Z perturbation
-        local angle  = math.Rand( 0, 360 )
-        local dist   = math.Rand( 0, JITTER_MAX )
-        self.Target  = self.Target + Vector(
-            math.cos( math.rad( angle ) ) * dist,
-            math.sin( math.rad( angle ) ) * dist,
-            0
-        )
-        self.TargetEntity = nil
-
-        -- apex: above the target, proportional to horizontal distance
-        local hDist      = ( self:GetPos() - self.Target ):Length2D()
-        local apexHeight = math.Clamp( hDist * 0.55, APEX_MIN, APEX_MAX )
-        self.ApexZ       = self.Target.z + apexHeight
-        self.CeilLimit   = self.ApexZ + CEIL_MARGIN
+    if not self.Target then
+        -- No target set by spawner — just fly straight and self-destruct
+        self.ArcReady = false
+        return
     end
+
+    -- P0: where the missile is right now
+    local p0 = self:GetPos()
+
+    -- P2: the fixed ground target, locked forever
+    local p2 = Vector( self.Target.x, self.Target.y, self.Target.z )
+
+    -- P1: apex — midpoint XY, lifted by APEX_FRAC * horizontal distance
+    local hDist      = ( p0 - p2 ):Length2D()
+    local apexHeight = math.Clamp( hDist * APEX_FRAC, APEX_MIN, APEX_MAX )
+    local midXY      = ( p0 + p2 ) * 0.5
+    local p1         = Vector( midXY.x, midXY.y, math.max( p0.z, p2.z ) + apexHeight )
+
+    self.ArcP0    = p0
+    self.ArcP1    = p1
+    self.ArcP2    = p2
+    self.ArcT     = 0
+    self.ArcReady = true
+
+    -- Null out Target so nothing can accidentally re-read/update it
+    self.Target = nil
+
+    print( string.format(
+        "[TopMissile] Arc baked | hDist=%.0f apex=%.0f P0=%s P1=%s P2=%s",
+        hDist, apexHeight, tostring(p0), tostring(p1), tostring(p2)
+    ))
 end
 
 -- ============================================================
---  Think  - timed phase guidance
+--  Think  -  advance along pre-baked arc
 -- ============================================================
 function ENT:Think()
     self:NextThink( CurTime() )
     if self.Destroyed then return true end
 
-    if CurTime() - self.SpawnTime > 40 then
+    -- safety timeout
+    if CurTime() - self.SpawnTime > 60 then
         self:DoExplosion()
         return true
     end
 
-    if not self.ActivatedAlmonds then
+    -- before arc is ready, coast forward
+    if not self.ArcReady then
         self:SetVelocity( self:GetForward() * self.Speed )
         return true
     end
 
-    if not self.Target then
-        self:SetVelocity( self:GetForward() * self.Speed )
-        return true
-    end
-
+    -- accelerate up to cap
     if self.Speed < SPEED_MAX then
         self.Speed = math.min( self.Speed + SPEED_ACCEL, SPEED_MAX )
     end
 
-    local mp      = self:GetPos()
-    local elapsed = CurTime() - self.EngineTime
-    local aimPos
+    local mp = self:GetPos()
 
-    if elapsed < PHASE1_END then
-        -- ---- PHASE 1: pure vertical climb ----
-        -- Aim at a point directly above the missile's CURRENT position.
-        -- XY is locked to self, so NO lateral steering at all.
-        -- Z ramps upward over the phase duration.
-        local t      = elapsed / PHASE1_END          -- 0 -> 1
-        local climbZ = mp.z + 300 + t * 500          -- +300 to +800 above current
-        aimPos = Vector( mp.x, mp.y, climbZ )
+    -- Advance t by how far we moved as a fraction of total arc length.
+    -- Approximate arc length as |P2 - P0| (good enough for guidance).
+    local approxLen = ( self.ArcP2 - self.ArcP0 ):Length()
+    if approxLen < 1 then approxLen = 1 end
+    local dt = self.Speed / approxLen   -- fraction of arc covered this tick (1 tick ~= 1/66 s but we don't divide by tick rate; speed is low enough)
+    self.ArcT = math.min( self.ArcT + dt * (1/66), 1 )
 
-    elseif elapsed < PHASE2_END then
-        -- ---- PHASE 2: arc forward over target ----
-        -- Aim at target XY but at apex Z height.
-        -- Missile will naturally arc over and forward.
-        local apexZ = self.ApexZ or ( self.Target.z + 600 )
-        aimPos = Vector( self.Target.x, self.Target.y, apexZ )
+    -- lookahead point on the arc
+    local lookT   = math.min( self.ArcT + LOOKAHEAD, 1 )
+    local aimPos  = BezierPoint( self.ArcP0, self.ArcP1, self.ArcP2, lookT )
 
-    else
-        -- ---- PHASE 3: dive onto target ----
-        aimPos = self.Target
+    -- point nose directly at lookahead (no LerpAngle — arc is smooth enough)
+    local dir = ( aimPos - mp ):GetNormalized()
+    self:SetAngles( dir:Angle() )
+    self:SetVelocity( dir * self.Speed )
+
+    -- explode when we reach the end of the arc
+    if self.ArcT >= 0.98 then
+        self:DoExplosion()
     end
-
-    -- hard ceiling backstop
-    if self.CeilLimit and aimPos.z > self.CeilLimit then
-        aimPos = Vector( aimPos.x, aimPos.y, self.CeilLimit )
-    end
-
-    local dist   = ( mp - self.Target ):Length()
-    local steer  = dist < NEAR_THRESHOLD and STEER_NEAR or STEER_FAR
-    local newAng = LerpAngle( steer, self:GetAngles(),
-                   ( aimPos - mp ):GetNormalized():Angle() )
-    self:SetAngles( newAng )
-    self:SetVelocity( self:GetForward() * self.Speed )
 
     return true
 end
