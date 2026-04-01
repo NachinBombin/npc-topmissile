@@ -5,6 +5,11 @@ include( "shared.lua" )
 -- ============================================================
 --  SERVER  –  NPC Top-Attack Terror Missile
 --  MOVETYPE_FLY  |  Touch() detonation  |  Think() guidance
+--
+--  GUIDANCE PHASES (timed from engine ignition):
+--    Phase 1  0.0 – 1.5s  : climb  – aim at fixed point above spawn
+--    Phase 2  1.5 – 3.5s  : arc    – aim at Target + apexHeight
+--    Phase 3  3.5s+       : dive   – aim straight at Target
 -- ============================================================
 
 ENT.HealthVal  = 30
@@ -12,23 +17,26 @@ ENT.Damage     = 0
 ENT.Radius     = 0
 ENT.Destroyed  = false
 
-local JITTER_MIN     = 256
-local JITTER_MAX     = 1200
+local JITTER_MIN     = 50
+local JITTER_MAX     = 300
 
-local SPEED_LAUNCH   = 900
-local SPEED_MAX      = 2200
-local SPEED_ACCEL    = 80
+local SPEED_LAUNCH   = 400
+local SPEED_MAX      = 900
+local SPEED_ACCEL    = 12
 
-local STEER_FAR      = 0.025
-local STEER_NEAR     = 0.12
-local NEAR_THRESHOLD = 800
+local STEER_FAR      = 0.06
+local STEER_NEAR     = 0.18
+local NEAR_THRESHOLD = 600
 
-local SKY_MASK       = MASK_SOLID   -- used for ceiling trace
-local CEIL_MARGIN    = 2048         -- how far above target we allow
+local PHASE1_END     = 1.5    -- seconds after engine start
+local PHASE2_END     = 3.5    -- seconds after engine start
+local APEX_MIN       = 400
+local APEX_MAX       = 1400
+local CEIL_MARGIN    = 800    -- max above apex we will ever aim
 
-local SND_LAUNCH  = "weapons/rpg/rocket1.wav"
-local SND_EXPLODE = "weapons/explode3.wav"
-local SND_WHOOSH  = "vehicles/combine_apc/apc_rocket_launch1.wav"
+local SND_LAUNCH     = "weapons/rpg/rocket1.wav"
+local SND_EXPLODE    = "weapons/explode3.wav"
+local SND_WHOOSH     = "vehicles/combine_apc/apc_rocket_launch1.wav"
 
 -- ============================================================
 --  Initialize
@@ -43,14 +51,16 @@ function ENT:Initialize()
 
     self.Destroyed        = false
     self.ActivatedAlmonds = false
-    self.Tracking         = false
-    self.InitialDistance  = nil
     self.Speed            = SPEED_LAUNCH
     self.SpawnTime        = CurTime()
-    self.CeilLimit        = nil   -- set once we know the target
+    self.EngineTime       = nil   -- set at FireEngine()
+    self.ApexPoint        = nil   -- set at FireEngine()
+    self.CeilLimit        = nil   -- set at FireEngine()
+    self.SpawnPos         = self:GetPos()
 
     self.EngineSound = CreateSound( self, SND_WHOOSH )
 
+    -- soft-loft: tilt 22 deg upward at spawn
     local a = self:GetAngles()
     a:RotateAroundAxis( self:GetRight(), 22 )
     self:SetAngles( a )
@@ -69,62 +79,74 @@ function ENT:Initialize()
 end
 
 -- ============================================================
---  Touch  –  ignore owner AND sky brushes
+--  Touch  –  ignore owner, ignore sky
 -- ============================================================
 function ENT:Touch( other )
     if self.Destroyed then return end
-    -- ignore the NPC that fired us
     if IsValid( other ) and other == self.Owner then return end
 
-    -- ignore world sky brush  (surface is CONTENTS_SKY)
-    -- do a tiny trace at our position; if the hit surface is sky, skip
-    local tr = util.TraceLine( {
-        start  = self:GetPos(),
-        endpos = self:GetPos() + self:GetForward() * 16,
-        filter = self,
-        mask   = MASK_SOLID,
-    } )
-    if tr.HitSky then return end
+    -- sky brush check: trace straight up a short distance
+    -- if we are near the sky ceiling, HitSky will be true
+    if other:IsWorld() then
+        local tr = util.TraceLine( {
+            start  = self:GetPos(),
+            endpos = self:GetPos() + Vector( 0, 0, 64 ),
+            filter = self,
+            mask   = MASK_SOLID,
+        } )
+        if tr.HitSky then return end
+    end
 
     self:DoExplosion()
 end
 
 -- ============================================================
---  FireEngine  – ignition + jitter
+--  FireEngine  – ignition, jitter, phase setup
 -- ============================================================
 function ENT:FireEngine()
     self.Damage           = math.random( 2500, 4500 )
     self.Radius           = math.random( 512,  760 )
     self.ActivatedAlmonds = true
+    self.EngineTime       = CurTime()
     self:SetNWBool( "EngineStarted", true )
     self.EngineSound:PlayEx( 90, 100 )
 
     if self.Target then
+        -- small jitter baked in at ignition
         local angle  = math.Rand( 0, 360 )
         local dist   = math.Rand( JITTER_MIN, JITTER_MAX )
         local jitter = Vector(
             math.cos( math.rad( angle ) ) * dist,
             math.sin( math.rad( angle ) ) * dist,
-            math.Rand( -150, 150 )
+            math.Rand( -60, 60 )
         )
         self.Target       = self.Target + jitter
         self.TargetEntity = nil
 
-        -- build a ceiling limit: missile may not exceed target.z + CEIL_MARGIN
-        -- this prevents it from climbing into the skybox
-        self.CeilLimit = self.Target.z + CEIL_MARGIN
+        -- apex height: proportional to real distance at ignition
+        local realDist   = ( self:GetPos() - self.Target ):Length2D()
+        local apexHeight = math.Clamp( realDist * 0.55, APEX_MIN, APEX_MAX )
+
+        -- ApexPoint: horizontally midway between current pos and target,
+        -- elevated by apexHeight above the higher of the two z values
+        local midXY      = ( self:GetPos() + self.Target ) * 0.5
+        local baseZ      = math.max( self:GetPos().z, self.Target.z )
+        self.ApexPoint   = Vector( midXY.x, midXY.y, baseZ + apexHeight )
+
+        -- ceiling: apex + margin  (hard stop against skybox)
+        self.CeilLimit   = self.ApexPoint.z + CEIL_MARGIN
     end
 end
 
 -- ============================================================
---  Think  – guidance + ceiling guard + lifetime
+--  Think  – timed phase guidance
 -- ============================================================
 function ENT:Think()
     self:NextThink( CurTime() )
     if self.Destroyed then return true end
 
     -- lifetime kill
-    if CurTime() - self.SpawnTime > 30 then
+    if CurTime() - self.SpawnTime > 40 then
         self:DoExplosion()
         return true
     end
@@ -140,43 +162,39 @@ function ENT:Think()
         return true
     end
 
-    -- accelerate
+    -- accelerate gradually
     if self.Speed < SPEED_MAX then
         self.Speed = math.min( self.Speed + SPEED_ACCEL, SPEED_MAX )
     end
 
-    local mp      = self:GetPos()
-    local _2dDist = Vector( mp.x, mp.y, 0 ):Distance(
-                    Vector( self.Target.x, self.Target.y, 0 ) )
-
-    if not self.InitialDistance then
-        self.InitialDistance = _2dDist > 0 and _2dDist or 1
-    end
-
-    local halfway   = self.InitialDistance * 0.9
-    local twoThirds = self.InitialDistance * 0.4
+    local mp       = self:GetPos()
+    local elapsed  = CurTime() - self.EngineTime
     local aimPos
 
-    if not self.Tracking then
-        if _2dDist > halfway then
-            aimPos = self.Target + Vector( 0, 0, 512 )
-        elseif _2dDist > twoThirds then
-            aimPos = self.Target + Vector( 0, 0,
-                math.Clamp( self.InitialDistance * 0.85, 256, 14500 ) )
-        else
-            aimPos        = self.Target
-            self.Tracking = true
-        end
+    -- ---- PHASE 1: climb straight up above spawn ----
+    if elapsed < PHASE1_END then
+        -- aim at a point directly above the spawn position
+        -- height ramps up over the phase so the missile arcs naturally
+        local climbZ = self.SpawnPos.z + 500 + ( elapsed / PHASE1_END ) * 400
+        aimPos = Vector( self.SpawnPos.x, self.SpawnPos.y, climbZ )
+
+    -- ---- PHASE 2: arc toward apex over target ----
+    elseif elapsed < PHASE2_END then
+        aimPos = self.ApexPoint or ( self.Target + Vector( 0, 0, 600 ) )
+
+    -- ---- PHASE 3: dive onto target ----
     else
         aimPos = self.Target
     end
 
-    -- ---- ceiling guard: clamp aimPos so we never steer into the sky ----
+    -- hard ceiling backstop
     if self.CeilLimit and aimPos.z > self.CeilLimit then
         aimPos = Vector( aimPos.x, aimPos.y, self.CeilLimit )
     end
 
-    local steer  = _2dDist < NEAR_THRESHOLD and STEER_NEAR or STEER_FAR
+    -- steer
+    local dist   = ( mp - self.Target ):Length()
+    local steer  = dist < NEAR_THRESHOLD and STEER_NEAR or STEER_FAR
     local newAng = LerpAngle( steer, self:GetAngles(),
                    ( aimPos - mp ):GetNormalized():Angle() )
     self:SetAngles( newAng )
