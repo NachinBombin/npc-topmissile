@@ -5,29 +5,38 @@ include( "shared.lua" )
 -- ============================================================
 --  SERVER  –  NPC Top-Attack Terror Missile
 --
---  Standalone: zero dependency on the Javelin addon.
---  Uses only stock HL2 / GMod models, sounds, and particles.
+--  Movement: MOVETYPE_FLY, Think()-driven. No VPhysics.
+--  Detonation: Touch() callback.
+--  Phases:
+--    0.75s soft-launch (no guidance, just loft upward)
+--    FireEngine() -> Phase 1 climb -> Phase 2 apex -> Phase 3 dive
 --
 --  TERROR BEHAVIOUR:
---    The missile aims at the target's position + a large random
---    jitter offset baked in at engine ignition.  It will
---    faithfully home onto that wrong point, flying the full
---    top-attack arc but landing anywhere from 256 to 1200 units
---    away from the actual enemy.  The jitter is committed once
---    and never corrected, so the miss is guaranteed from launch.
+--    Jitter offset baked onto Target at engine ignition.
+--    The missile commits to missing from that moment; never corrects.
 -- ============================================================
 
 -- ---- Stats ----
-ENT.HealthVal  = 30          -- can be shot down
-ENT.Damage     = 0           -- randomised in FireEngine
-ENT.Radius     = 0           -- randomised in FireEngine
+ENT.HealthVal  = 30
+ENT.Damage     = 0
+ENT.Radius     = 0
 ENT.Destroyed  = false
 
 -- ---- Jitter config ----
-local JITTER_MIN = 256   -- minimum miss distance (units)
-local JITTER_MAX = 1200  -- maximum miss distance (units)
+local JITTER_MIN = 256
+local JITTER_MAX = 1200
 
--- ---- Stock sounds (HL2 / base GMod, no custom files needed) ----
+-- ---- Speeds ----
+local SPEED_LAUNCH   = 900    -- initial ejection speed (units/s)
+local SPEED_MAX      = 2200   -- terminal cruise speed
+local SPEED_ACCEL    = 80     -- added per Think() tick
+
+-- ---- Guidance ----
+local STEER_FAR      = 0.025  -- angular lerp factor far from target
+local STEER_NEAR     = 0.12   -- angular lerp factor in terminal dive
+local NEAR_THRESHOLD = 800    -- distance at which STEER_NEAR kicks in
+
+-- ---- Stock sounds ----
 local SND_LAUNCH  = "weapons/rpg/rocket1.wav"
 local SND_EXPLODE = "weapons/explode3.wav"
 local SND_WHOOSH  = "vehicles/combine_apc/apc_rocket_launch1.wav"
@@ -37,68 +46,68 @@ local SND_WHOOSH  = "vehicles/combine_apc/apc_rocket_launch1.wav"
 -- ============================================================
 function ENT:Initialize()
     self:SetModel( "models/weapons/w_rocket.mdl" )
-    self:SetColor( Color( 0, 0, 0 ) )
 
-    self:PhysicsInit( SOLID_VPHYSICS )
-    self:SetMoveType( MOVETYPE_VPHYSICS )
-    self:SetSolid( SOLID_VPHYSICS )
+    -- FLY movement: no VPhysics, no instant ground collision
+    self:SetMoveType( MOVETYPE_FLY )
+    self:SetSolid( SOLID_BBOX )
+    self:SetCollisionGroup( COLLISION_GROUP_PROJECTILE )
+    self:SetCollisionBounds( Vector( -4, -4, -4 ), Vector( 4, 4, 4 ) )
 
-    self.PhysObj = self:GetPhysicsObject()
-    if self.PhysObj:IsValid() then
-        self.PhysObj:Wake()
-        self.PhysObj:SetMass( 500 )
-        self.PhysObj:EnableDrag( true )
-        self.PhysObj:EnableGravity( true )
-    end
+    -- Touch-based detonation (reliable, no frame-0 self-hit)
+    self:AddCallback( "PhysicsCollide", function() end )  -- suppress default
 
-    self.SpeedValue            = 0
-    self.Destroyed             = false
-    self.ActivatedAlmonds      = false
-    self.UseMovingTargetAiming = false
-    self.Tracking              = false
-    self.InitialDistance       = nil
+    self.Destroyed         = false
+    self.ActivatedAlmonds  = false
+    self.Tracking          = false
+    self.InitialDistance   = nil
+    self.Speed             = SPEED_LAUNCH
+    self.SpawnTime         = CurTime()
 
     self.EngineSound = CreateSound( self, SND_WHOOSH )
 
-    -- FIX: loft the missile upward (not sideways) at spawn
+    -- Loft upward 22 degrees at spawn
     local a = self:GetAngles()
     a:RotateAroundAxis( self:GetRight(), 22 )
     self:SetAngles( a )
-    self:SetPos( self:GetPos() + self:GetUp() * 32 + self:GetForward() * -32 )
+    self:SetPos( self:GetPos() + self:GetUp() * 32 )
 
-    -- FIX: sane ejection velocity (was 108450 which teleported the missile out of the map)
-    if self.PhysObj:IsValid() then
-        self.PhysObj:SetVelocityInstantaneous( self:GetForward() * 900 )
-    end
-
-    -- Launch flash (stock)
-    local launchAng = self:GetAngles()
-    launchAng:RotateAroundAxis( self:GetUp(), 180 )
-    ParticleEffect( "weapon_muzzle_smoke", self:GetPos(), launchAng, nil )
+    -- Kick the missile forward immediately
+    self:SetVelocity( self:GetForward() * SPEED_LAUNCH )
 
     -- Launch sound
-    sound.Play( SND_LAUNCH, self:GetPos(), 511, 100 )
+    sound.Play( SND_LAUNCH, self:GetPos(), 90, 100 )
 
-    -- Engine fires after 0.75s soft-launch delay
+    -- Engine ignites after 0.75s soft-launch
+    local selfRef = self
     timer.Simple( 0.75, function()
-        if not IsValid( self ) then return end
-        self:FireEngine()
+        if not IsValid( selfRef ) then return end
+        selfRef:FireEngine()
     end )
 
-    self.HealthVal = 30
+    self:NextThink( CurTime() )
 end
 
 -- ============================================================
---  Engine ignition + bake in the jitter offset
+--  Touch → detonate on anything except the owner
+-- ============================================================
+function ENT:Touch( other )
+    if self.Destroyed then return end
+    -- Ignore the Gekko that fired us and other missiles
+    if IsValid( other ) and other == self.Owner then return end
+    self:DoExplosion()
+end
+
+-- ============================================================
+--  Engine ignition + bake jitter
 -- ============================================================
 function ENT:FireEngine()
     self.Damage           = math.random( 2500, 4500 )
-    self.Radius           = math.random( 512, 760 )
+    self.Radius           = math.random( 512,  760  )
     self.ActivatedAlmonds = true
     self:SetNWBool( "EngineStarted", true )
-    self.EngineSound:PlayEx( 511, 100 )
+    self.EngineSound:PlayEx( 90, 100 )
 
-    -- TERROR JITTER: bake a random miss offset onto Target once, never correct it.
+    -- Bake the jitter offset onto Target once
     if self.Target then
         local angle  = math.Rand( 0, 360 )
         local dist   = math.Rand( JITTER_MIN, JITTER_MAX )
@@ -116,84 +125,84 @@ function ENT:FireEngine()
     a:RotateAroundAxis( self:GetUp(), 180 )
 
     local prop = ents.Create( "prop_physics" )
-    prop:SetPos( self:LocalToWorld( Vector( -15, 0, 0 ) ) )
-    prop:SetAngles( a )
-    prop:SetParent( self )
-    prop:SetModel( "models/items/ar2_grenade.mdl" )
-    prop:Spawn()
-    prop:SetRenderMode( RENDERMODE_TRANSALPHA )
-    prop:SetColor( Color( 0, 0, 0, 0 ) )
+    if IsValid( prop ) then
+        prop:SetPos( self:LocalToWorld( Vector( -15, 0, 0 ) ) )
+        prop:SetAngles( a )
+        prop:SetParent( self )
+        prop:SetModel( "models/items/ar2_grenade.mdl" )
+        prop:Spawn()
+        prop:SetRenderMode( RENDERMODE_TRANSALPHA )
+        prop:SetColor( Color( 0, 0, 0, 0 ) )
+        ParticleEffectAttach( "HelicopterMegaBomb_Trail", PATTACH_ABSORIGIN_FOLLOW, prop, 0 )
+    end
 
-    ParticleEffectAttach( "HelicopterMegaBomb_Trail", PATTACH_ABSORIGIN_FOLLOW, prop, 0 )
     ParticleEffect( "weapon_muzzle_smoke", self:GetPos(), a, nil )
 end
 
 -- ============================================================
---  Physics collision → detonate
+--  Think → guidance loop + lifetime
 -- ============================================================
-function ENT:PhysicsCollide( data )
-    if self.Destroyed then return end
-    self:DoExplosion()
-end
+function ENT:Think()
+    self:NextThink( CurTime() )
+    if self.Destroyed then return true end
 
--- ============================================================
---  Physics update → top-attack guidance toward jittered point
--- ============================================================
-function ENT:PhysicsUpdate()
-    if not self.ActivatedAlmonds then return end
-
-    -- Speed ramp up to ~2200 units/s
-    if self:GetVelocity():Length() < 2200 then
-        self.SpeedValue = self.SpeedValue + 250
+    -- 30s lifetime safety net
+    if CurTime() - self.SpawnTime > 30 then
+        self:DoExplosion()
+        return true
     end
 
-    if not self.Target then return end
+    -- No guidance until engine is on
+    if not self.ActivatedAlmonds then
+        -- During soft-launch just keep moving forward
+        self:SetVelocity( self:GetForward() * self.Speed )
+        return true
+    end
+
+    if not self.Target then
+        self:SetVelocity( self:GetForward() * self.Speed )
+        return true
+    end
+
+    -- Speed ramp
+    if self.Speed < SPEED_MAX then
+        self.Speed = math.min( self.Speed + SPEED_ACCEL, SPEED_MAX )
+    end
 
     local mp      = self:GetPos()
-    local _2dDist = ( Vector( mp.x, mp.y, 0 ) - Vector( self.Target.x, self.Target.y, 0 ) ):Length()
+    local _2dDist = Vector( mp.x, mp.y, 0 ):Distance( Vector( self.Target.x, self.Target.y, 0 ) )
 
-    -- FIX: guard against zero InitialDistance to prevent degenerate phase thresholds
     if not self.InitialDistance then
         self.InitialDistance = _2dDist > 0 and _2dDist or 1
     end
 
+    -- ---- Phase selection ----
     local halfway   = self.InitialDistance * 0.9
     local twoThirds = self.InitialDistance * 0.4
-    local pos       = self.Target
+    local aimPos
 
     if not self.Tracking then
         if _2dDist > halfway then
-            -- Phase 1 – climb
-            pos = self.Target + Vector( 0, 0, 512 )
+            -- Phase 1: climb
+            aimPos = self.Target + Vector( 0, 0, 512 )
         elseif _2dDist > twoThirds then
-            -- Phase 2 – apex
-            pos = self.Target + Vector( 0, 0, math.Clamp( self.InitialDistance * 0.85, 0, 14500 ) )
+            -- Phase 2: apex
+            aimPos = self.Target + Vector( 0, 0, math.Clamp( self.InitialDistance * 0.85, 256, 14500 ) )
         else
-            -- Phase 3 – terminal dive onto the jittered point
-            pos           = self.Target
+            -- Phase 3: terminal dive
+            aimPos        = self.Target
             self.Tracking = true
         end
     else
-        pos = self.Target
+        aimPos = self.Target
     end
 
-    local lerpVal = _2dDist < 1000 and 0.1 or 0.01
-    self:SetAngles( LerpAngle( lerpVal, self:GetAngles(), ( pos - mp ):GetNormalized():Angle() ) )
-    self.PhysObj:ApplyForceCenter( self:GetForward() * self.SpeedValue )
-end
-
--- ============================================================
---  Think → 30s lifetime safety net
--- ============================================================
-function ENT:Think()
-    self:NextThink( CurTime() )
-
-    if not self.SpawnTime then
-        self.SpawnTime = CurTime()
-    end
-    if CurTime() - self.SpawnTime > 30 then
-        self:DoExplosion()
-    end
+    -- ---- Steering ----
+    local steer   = _2dDist < NEAR_THRESHOLD and STEER_NEAR or STEER_FAR
+    local wantAng = ( aimPos - mp ):GetNormalized():Angle()
+    local newAng  = LerpAngle( steer, self:GetAngles(), wantAng )
+    self:SetAngles( newAng )
+    self:SetVelocity( self:GetForward() * self.Speed )
 
     return true
 end
@@ -216,46 +225,41 @@ function ENT:DoExplosion()
     if self.Destroyed then return end
     self.Destroyed = true
 
+    -- Guard: if FireEngine() never ran, use safe fallback values
+    local dmg    = self.Damage > 0 and self.Damage or 1200
+    local radius = self.Radius > 0 and self.Radius or 512
+
     local pos   = self:GetPos()
     local owner = IsValid( self.Owner ) and self.Owner or self
 
-    self:EmitSound( SND_EXPLODE, 511, 100 )
-    sound.Play( SND_EXPLODE, pos, 511, 100 )
+    if self.EngineSound then self.EngineSound:Stop() end
+
+    sound.Play( SND_EXPLODE, pos, 100, 100 )
 
     local ed = EffectData()
     ed:SetOrigin( pos )
-    ed:SetMagnitude( self.Radius )
+    ed:SetMagnitude( radius )
     ed:SetScale( 1 )
-    ed:SetRadius( self.Radius )
+    ed:SetRadius( radius )
     util.Effect( "Explosion", ed )
 
     ParticleEffect( "explosion_huge",      pos, self:GetAngles(), nil )
     ParticleEffect( "weapon_muzzle_smoke", pos, self:GetAngles(), nil )
 
-    -- Wake nearby props
-    for _, v in ipairs( ents.FindInSphere( pos, self.Radius / 4 ) ) do
-        if not v.HealthVal then
-            local vp = v:GetPhysicsObject()
-            if IsValid( vp ) then
-                vp:Wake()
-                vp:EnableMotion( true )
-                vp:EnableGravity( true )
-            end
-        end
+    -- Physics shockwave (only now that radius/dmg are real values)
+    local pe = ents.Create( "env_physexplosion" )
+    if IsValid( pe ) then
+        pe:SetPos( pos )
+        pe:SetKeyValue( "Magnitude",  tostring( math.floor( dmg * 0.5 ) ) )
+        pe:SetKeyValue( "radius",     tostring( radius ) )
+        pe:SetKeyValue( "spawnflags", "19" )
+        pe:Spawn()
+        pe:Activate()
+        pe:Fire( "Explode", "", 0 )
+        pe:Fire( "Kill",    "", 0.5 )
     end
 
-    -- Physics shockwave
-    local pe = ents.Create( "env_physexplosion" )
-    pe:SetPos( pos )
-    pe:SetKeyValue( "Magnitude",  tostring( 5 * self.Damage ) )
-    pe:SetKeyValue( "radius",     tostring( self.Radius ) )
-    pe:SetKeyValue( "spawnflags", "19" )
-    pe:Spawn()
-    pe:Activate()
-    pe:Fire( "Explode", "", 0 )
-    pe:Fire( "Kill",    "", 0.5 )
-
-    util.BlastDamage( self, owner, pos + Vector( 0, 0, 50 ), self.Radius, self.Damage )
+    util.BlastDamage( self, owner, pos + Vector( 0, 0, 50 ), radius, dmg )
 
     self:Remove()
 end
