@@ -5,16 +5,16 @@ include( "shared.lua" )
 -- ============================================================
 --  SERVER  –  NPC Top-Attack Terror Missile
 --
---  Fully standalone: zero dependency on the Javelin addon.
+--  Standalone: zero dependency on the Javelin addon.
 --  Uses only stock HL2 / GMod models, sounds, and particles.
 --
 --  TERROR BEHAVIOUR:
 --    The missile aims at the target's position + a large random
---    jitter offset baked in at spawn.  It will faithfully home
---    onto that wrong point, flying the full top-attack arc but
---    landing somewhere wildly off – anywhere from 256 to 1200
---    units away from the actual enemy.  It never corrects the
---    jitter once set, so the miss is committed from launch.
+--    jitter offset baked in at engine ignition.  It will
+--    faithfully home onto that wrong point, flying the full
+--    top-attack arc but landing anywhere from 256 to 1200 units
+--    away from the actual enemy.  The jitter is committed once
+--    and never corrected, so the miss is guaranteed from launch.
 -- ============================================================
 
 -- ---- Stats ----
@@ -23,7 +23,7 @@ ENT.Damage     = 0           -- randomised in FireEngine
 ENT.Radius     = 0           -- randomised in FireEngine
 ENT.Destroyed  = false
 
--- ---- Jitter config (tune these to taste) ----
+-- ---- Jitter config ----
 local JITTER_MIN = 256   -- minimum miss distance (units)
 local JITTER_MAX = 1200  -- maximum miss distance (units)
 
@@ -37,7 +37,7 @@ local SND_WHOOSH  = "vehicles/combine_apc/apc_rocket_launch1.wav"
 -- ============================================================
 function ENT:Initialize()
     self:SetModel( "models/weapons/w_rocket.mdl" )
-    self:SetColor( Color( 0, 0, 0 ) )   -- all black, no custom texture needed
+    self:SetColor( Color( 0, 0, 0 ) )
 
     self:PhysicsInit( SOLID_VPHYSICS )
     self:SetMoveType( MOVETYPE_VPHYSICS )
@@ -60,18 +60,15 @@ function ENT:Initialize()
 
     self.EngineSound = CreateSound( self, SND_WHOOSH )
 
-    -- Tilt 22 degrees upward (soft-launch loft, mirrors Javelin)
+    -- FIX: loft the missile upward (not sideways) at spawn
     local a = self:GetAngles()
     a:RotateAroundAxis( self:GetRight(), 22 )
     self:SetAngles( a )
-    self:SetPos( self:GetPos() + self:GetRight() * 8 + self:GetForward() * -32 + self:GetUp() * 8 )
+    self:SetPos( self:GetPos() + self:GetUp() * 32 + self:GetForward() * -32 )
 
-    -- Ejection velocity
-    self.PhysObj:SetVelocityInstantaneous( self:GetForward() * 108450 )
-
-    -- Backblast behind the NPC launcher
-    for i = 1, 7 do
-        util.BlastDamage( self, self.Owner, self:GetPos() + self:GetForward() * ( i * -42 ), 10, 16 )
+    -- FIX: sane ejection velocity (was 108450 which teleported the missile out of the map)
+    if self.PhysObj:IsValid() then
+        self.PhysObj:SetVelocityInstantaneous( self:GetForward() * 900 )
     end
 
     -- Launch flash (stock)
@@ -101,24 +98,20 @@ function ENT:FireEngine()
     self:SetNWBool( "EngineStarted", true )
     self.EngineSound:PlayEx( 511, 100 )
 
-    -- ---- TERROR JITTER ----
-    -- Pick a random direction on the XY plane and a random
-    -- distance between JITTER_MIN and JITTER_MAX.
-    -- This offset is baked onto Target once and never changes,
-    -- so the missile commits to missing from this moment forward.
+    -- TERROR JITTER: bake a random miss offset onto Target once, never correct it.
     if self.Target then
         local angle  = math.Rand( 0, 360 )
         local dist   = math.Rand( JITTER_MIN, JITTER_MAX )
         local jitter = Vector(
             math.cos( math.rad( angle ) ) * dist,
             math.sin( math.rad( angle ) ) * dist,
-            math.Rand( -150, 150 )          -- small vertical wobble too
+            math.Rand( -150, 150 )
         )
-        self.Target       = self.Target + jitter   -- commit the miss
-        self.TargetEntity = nil                    -- ignore the live entity
+        self.Target       = self.Target + jitter
+        self.TargetEntity = nil
     end
 
-    -- Invisible prop for exhaust trail (stock ar2 grenade model, zeroed alpha)
+    -- Invisible exhaust prop for smoke trail
     local a = self:GetAngles()
     a:RotateAroundAxis( self:GetUp(), 180 )
 
@@ -131,7 +124,6 @@ function ENT:FireEngine()
     prop:SetRenderMode( RENDERMODE_TRANSALPHA )
     prop:SetColor( Color( 0, 0, 0, 0 ) )
 
-    -- Stock smoke trail particle (built into HL2)
     ParticleEffectAttach( "HelicopterMegaBomb_Trail", PATTACH_ABSORIGIN_FOLLOW, prop, 0 )
     ParticleEffect( "weapon_muzzle_smoke", self:GetPos(), a, nil )
 end
@@ -160,8 +152,9 @@ function ENT:PhysicsUpdate()
     local mp      = self:GetPos()
     local _2dDist = ( Vector( mp.x, mp.y, 0 ) - Vector( self.Target.x, self.Target.y, 0 ) ):Length()
 
+    -- FIX: guard against zero InitialDistance to prevent degenerate phase thresholds
     if not self.InitialDistance then
-        self.InitialDistance = _2dDist
+        self.InitialDistance = _2dDist > 0 and _2dDist or 1
     end
 
     local halfway   = self.InitialDistance * 0.9
@@ -226,11 +219,9 @@ function ENT:DoExplosion()
     local pos   = self:GetPos()
     local owner = IsValid( self.Owner ) and self.Owner or self
 
-    -- Sounds (stock HL2)
     self:EmitSound( SND_EXPLODE, 511, 100 )
     sound.Play( SND_EXPLODE, pos, 511, 100 )
 
-    -- Visual explosion (stock GMod)
     local ed = EffectData()
     ed:SetOrigin( pos )
     ed:SetMagnitude( self.Radius )
@@ -238,7 +229,6 @@ function ENT:DoExplosion()
     ed:SetRadius( self.Radius )
     util.Effect( "Explosion", ed )
 
-    -- Secondary particles (stock)
     ParticleEffect( "explosion_huge",      pos, self:GetAngles(), nil )
     ParticleEffect( "weapon_muzzle_smoke", pos, self:GetAngles(), nil )
 
@@ -265,7 +255,6 @@ function ENT:DoExplosion()
     pe:Fire( "Explode", "", 0 )
     pe:Fire( "Kill",    "", 0.5 )
 
-    -- Blast damage
     util.BlastDamage( self, owner, pos + Vector( 0, 0, 50 ), self.Radius, self.Damage )
 
     self:Remove()
