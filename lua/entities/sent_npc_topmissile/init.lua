@@ -4,15 +4,7 @@ include( "shared.lua" )
 
 -- ============================================================
 --  SERVER  –  NPC Top-Attack Terror Missile
---
---  Movement : MOVETYPE_FLY, Think()-driven. No VPhysics.
---  Detonation: Touch() callback.
---  Phases:
---    0.75s soft-launch (no guidance, loft upward)
---    FireEngine() -> Phase 1 climb -> Phase 2 apex -> Phase 3 dive
---
---  TERROR BEHAVIOUR:
---    Jitter baked onto Target at engine ignition. Never corrected.
+--  MOVETYPE_FLY  |  Touch() detonation  |  Think() guidance
 -- ============================================================
 
 ENT.HealthVal  = 30
@@ -31,6 +23,9 @@ local STEER_FAR      = 0.025
 local STEER_NEAR     = 0.12
 local NEAR_THRESHOLD = 800
 
+local SKY_MASK       = MASK_SOLID   -- used for ceiling trace
+local CEIL_MARGIN    = 2048         -- how far above target we allow
+
 local SND_LAUNCH  = "weapons/rpg/rocket1.wav"
 local SND_EXPLODE = "weapons/explode3.wav"
 local SND_WHOOSH  = "vehicles/combine_apc/apc_rocket_launch1.wav"
@@ -39,7 +34,7 @@ local SND_WHOOSH  = "vehicles/combine_apc/apc_rocket_launch1.wav"
 --  Initialize
 -- ============================================================
 function ENT:Initialize()
-    self:SetModel( "models/weapons/w_missile.mdl" )   -- in-game RPG rocket
+    self:SetModel( "models/weapons/w_missile.mdl" )
 
     self:SetMoveType( MOVETYPE_FLY )
     self:SetSolid( SOLID_BBOX )
@@ -52,15 +47,14 @@ function ENT:Initialize()
     self.InitialDistance  = nil
     self.Speed            = SPEED_LAUNCH
     self.SpawnTime        = CurTime()
+    self.CeilLimit        = nil   -- set once we know the target
 
     self.EngineSound = CreateSound( self, SND_WHOOSH )
 
-    -- Loft upward 22 deg at spawn
     local a = self:GetAngles()
     a:RotateAroundAxis( self:GetRight(), 22 )
     self:SetAngles( a )
     self:SetPos( self:GetPos() + self:GetUp() * 32 )
-
     self:SetVelocity( self:GetForward() * SPEED_LAUNCH )
 
     sound.Play( SND_LAUNCH, self:GetPos(), 90, 100 )
@@ -75,16 +69,28 @@ function ENT:Initialize()
 end
 
 -- ============================================================
---  Touch → detonate (ignore owner)
+--  Touch  –  ignore owner AND sky brushes
 -- ============================================================
 function ENT:Touch( other )
     if self.Destroyed then return end
+    -- ignore the NPC that fired us
     if IsValid( other ) and other == self.Owner then return end
+
+    -- ignore world sky brush  (surface is CONTENTS_SKY)
+    -- do a tiny trace at our position; if the hit surface is sky, skip
+    local tr = util.TraceLine( {
+        start  = self:GetPos(),
+        endpos = self:GetPos() + self:GetForward() * 16,
+        filter = self,
+        mask   = MASK_SOLID,
+    } )
+    if tr.HitSky then return end
+
     self:DoExplosion()
 end
 
 -- ============================================================
---  Engine ignition + bake jitter
+--  FireEngine  – ignition + jitter
 -- ============================================================
 function ENT:FireEngine()
     self.Damage           = math.random( 2500, 4500 )
@@ -103,21 +109,27 @@ function ENT:FireEngine()
         )
         self.Target       = self.Target + jitter
         self.TargetEntity = nil
+
+        -- build a ceiling limit: missile may not exceed target.z + CEIL_MARGIN
+        -- this prevents it from climbing into the skybox
+        self.CeilLimit = self.Target.z + CEIL_MARGIN
     end
 end
 
 -- ============================================================
---  Think → guidance loop + lifetime
+--  Think  – guidance + ceiling guard + lifetime
 -- ============================================================
 function ENT:Think()
     self:NextThink( CurTime() )
     if self.Destroyed then return true end
 
+    -- lifetime kill
     if CurTime() - self.SpawnTime > 30 then
         self:DoExplosion()
         return true
     end
 
+    -- pre-ignition: fly straight
     if not self.ActivatedAlmonds then
         self:SetVelocity( self:GetForward() * self.Speed )
         return true
@@ -128,6 +140,7 @@ function ENT:Think()
         return true
     end
 
+    -- accelerate
     if self.Speed < SPEED_MAX then
         self.Speed = math.min( self.Speed + SPEED_ACCEL, SPEED_MAX )
     end
@@ -158,6 +171,11 @@ function ENT:Think()
         aimPos = self.Target
     end
 
+    -- ---- ceiling guard: clamp aimPos so we never steer into the sky ----
+    if self.CeilLimit and aimPos.z > self.CeilLimit then
+        aimPos = Vector( aimPos.x, aimPos.y, self.CeilLimit )
+    end
+
     local steer  = _2dDist < NEAR_THRESHOLD and STEER_NEAR or STEER_FAR
     local newAng = LerpAngle( steer, self:GetAngles(),
                    ( aimPos - mp ):GetNormalized():Angle() )
@@ -168,7 +186,7 @@ function ENT:Think()
 end
 
 -- ============================================================
---  Damage – can be shot down
+--  Damage  – can be shot down
 -- ============================================================
 function ENT:OnTakeDamage( dmginfo )
     if self.Destroyed then return end
@@ -185,9 +203,8 @@ function ENT:DoExplosion()
 
     local dmg    = self.Damage > 0 and self.Damage or 1200
     local radius = self.Radius > 0 and self.Radius or 512
-
-    local pos   = self:GetPos()
-    local owner = IsValid( self.Owner ) and self.Owner or self
+    local pos    = self:GetPos()
+    local owner  = IsValid( self.Owner ) and self.Owner or self
 
     if self.EngineSound then self.EngineSound:Stop() end
 
