@@ -3,61 +3,48 @@ AddCSLuaFile( "shared.lua" )
 include( "shared.lua" )
 
 -- ============================================================
---  SERVER  --  NPC Top-Attack Terror Missile  (v3 -- circle-fix)
+--  SERVER  --  NPC Top-Attack Terror Missile  (v4)
 --
---  ROOT CAUSE OF THE "FLIES IN CIRCLES" BUG:
+--  BUGS FIXED THIS VERSION:
 --
---    The Gekko calls:
---        missile:SetAngles( Angle(-90, yaw, 0) )   -- nose up
---        missile:Spawn()
---        missile:Activate()            -- triggers Initialize()
+--  BUG A: "stays in place" after v3
+--    Root cause: EnableGravity(true) + ApplyForceCenter ramp.
+--    SpeedValue starts at 0 and increments by 250/tick.  With
+--    gravity on, the body falls and settles on the ground before
+--    the ramp builds enough thrust to lift it.  The 108450 kick
+--    in FireEngine() was correct but gravity immediately countered
+--    it each subsequent tick while SpeedValue was still tiny.
+--    Fix: disable gravity on the physics body and drive ALL
+--    movement via SetVelocityInstantaneous() each tick, exactly
+--    like the original working Javelin base.  No gravity fight.
 --
---    Inside Initialize(), the OLD code called:
---        self:SetAngles( upAng )       -- entity call -- IGNORED on VPHYSICS
+--  BUG B: util.EffectExists crash
+--    util.EffectExists does not exist in this version of GMod /
+--    VJ Base.  Removed the call; vj_explosion3 is attempted
+--    directly inside a pcall so a missing particle never errors.
 --
---    On MOVETYPE_VPHYSICS the SOURCE physics engine owns orientation.
---    entity:SetAngles() queues a wish that the physics engine
---    immediately overwrites.  The body stayed in whatever random
---    orientation the engine assigned at Spawn().
---
---    In PhysicsUpdate() the steering does:
---        phys:SetAngles( newAng )        -- correct
---        phys:ApplyForceCenter( self:GetForward() * speed )
---
---    BUT self:GetForward() returns the ENTITY forward, which lags
---    one tick behind the physics body's orientation after the
---    phys:SetAngles() call.  So thrust is always applied in the
---    PREVIOUS frame's direction -- the missile circles endlessly
---    because force and heading never agree.
---
---  TWO-PART FIX:
---    1.  In Initialize() and FireEngine(): use phys:SetAngles()
---        AND phys:SetAngleVelocity(0) so the body is truly pointing up.
---    2.  In PhysicsUpdate(): use PhysForward(phys) -- reads
---        phys:GetAngles():Forward() -- for thrust so force always
---        matches the physics body's CURRENT orientation.
---
---  CALLER SIDE (Gekko) is UNCHANGED -- it still sets:
---    missile:SetAngles( Angle(-90, yaw, 0) )
---    missile.Target = enemy:GetPos() + Vector(0,0,40)
---    missile:Spawn() / :Activate()
+--  CIRCLE BUG FIX (kept from v3):
+--    phys:SetAngles() instead of entity:SetAngles() in
+--    Initialize() and FireEngine().  PhysForward(phys) for
+--    thrust direction so force and heading always agree.
 -- ============================================================
 
 local SND_LAUNCH  = "weapons/rpg/rocket1.wav"
 local SND_ENGINE  = "vehicles/combine_apc/apc_rocket_launch1.wav"
 local SND_EXPLODE = "ambient/explosions/explode_8.wav"
 
-local SPEED_CAP = game.SinglePlayer() and 1800 or 2300
-local LIFETIME  = 45
+local SPEED_CAP  = 2200   -- units/s terminal velocity
+local SPEED_STEP = 55     -- units/s added per PhysicsUpdate tick
+local LIFETIME   = 45     -- seconds before auto-detonate
 
--- Terror jitter: missile lands NEAR target, never on it
+-- Terror jitter: committed at engine ignition, never corrected
 local JITTER_MIN = 256
 local JITTER_MAX = 1200
 
 -- ============================================================
---  Helper: physics body's authoritative forward vector.
---  phys:GetAngles():Forward() is one tick ahead of entity:GetAngles()
---  after a phys:SetAngles() call -- use this for thrust.
+--  Helper: authoritative forward from the physics body.
+--  After phys:SetAngles(), phys:GetAngles():Forward() reflects
+--  the NEW orientation immediately; entity:GetForward() lags.
 -- ============================================================
 local function PhysForward( phys )
     return phys:GetAngles():Forward()
@@ -75,37 +62,32 @@ function ENT:Initialize()
     self:SetSolid( SOLID_VPHYSICS )
     self:SetCollisionGroup( COLLISION_GROUP_PROJECTILE )
 
-    self.PhysObj = self:GetPhysicsObject()
-    if IsValid( self.PhysObj ) then
-        self.PhysObj:Wake()
-        self.PhysObj:SetMass( 500 )
-        self.PhysObj:EnableDrag( true )
-        self.PhysObj:EnableGravity( true )
-        self.PhysObj:SetVelocity( Vector( 0, 0, 0 ) )
-        self.PhysObj:SetAngleVelocity( Vector( 0, 0, 0 ) )
+    local phys = self:GetPhysicsObject()
+    if IsValid( phys ) then
+        phys:Wake()
+        phys:SetMass( 500 )
+        phys:EnableDrag( false )       -- no drag fighting the thrust
+        phys:EnableGravity( false )    -- FIX A: gravity off; we own all motion
+        phys:SetVelocity( Vector( 0, 0, 0 ) )
+        phys:SetAngleVelocity( Vector( 0, 0, 0 ) )
 
-        -- FIX PART 1:
-        -- entity:SetAngles() is silently ignored on MOVETYPE_VPHYSICS.
-        -- We MUST call phys:SetAngles() so the rigid body is actually
-        -- pointing nose-up before FireEngine() kicks it upward.
+        -- Point nose straight up using phys:SetAngles().
+        -- entity:SetAngles() is ignored on MOVETYPE_VPHYSICS.
         local upAng = Angle( -90, self:GetAngles().y, 0 )
-        self.PhysObj:SetAngles( upAng )
-        self.PhysObj:SetAngleVelocity( Vector( 0, 0, 0 ) )
-        self:SetAngles( upAng )   -- keep entity in sync for any GetForward() callers
+        phys:SetAngles( upAng )
+        phys:SetAngleVelocity( Vector( 0, 0, 0 ) )
+        self:SetAngles( upAng )
     end
 
-    -- State
     self.SpeedValue       = 0
     self.Destroyed        = false
     self.ActivatedAlmonds = false
     self.InitialDistance  = nil
-    self.Tracking         = false
     self.SpawnTime        = CurTime()
     self.HealthVal        = 50
     self.Damage           = 0
     self.Radius           = 0
 
-    -- Validate Target (set by Gekko BEFORE Spawn())
     if not self.Target or type( self.Target ) ~= "Vector" then
         local fwd = self:GetAngles():Forward()
         fwd.z = 0
@@ -137,35 +119,34 @@ function ENT:FireEngine()
     self.Radius = math.random( 512,  760  )
     self.EngineSound:PlayEx( 511, 100 )
     self.ActivatedAlmonds = true
+    self.SpeedValue       = 800      -- start with a healthy base speed
     self:SetNWBool( "EngineStarted", true )
 
     local phys = self:GetPhysicsObject()
     if IsValid( phys ) then
-        -- FIX PART 1 (repeated): re-affirm nose-up via phys:SetAngles()
-        -- in case any collision or gravity nudged the body during the delay.
+        -- Re-affirm nose-up in case gravity/collision nudged it during delay
         local upAng = Angle( -90, self:GetAngles().y, 0 )
         phys:SetAngles( upAng )
         phys:SetAngleVelocity( Vector( 0, 0, 0 ) )
         self:SetAngles( upAng )
+        phys:EnableGravity( false )   -- confirm still off
 
-        -- Kick straight up using PhysForward so the direction is authoritative.
-        phys:SetVelocityInstantaneous( PhysForward( phys ) * 108450 )
+        -- Initial upward kick via velocity (not force) so it moves immediately
+        phys:SetVelocityInstantaneous( PhysForward( phys ) * 1800 )
     end
 
-    -- TERROR JITTER: bake a random miss offset into Target once.
-    -- Committed at engine ignition, never corrected.
+    -- TERROR JITTER: bake random miss offset into Target once
     if self.Target then
-        local angle  = math.Rand( 0, 360 )
-        local dist   = math.Rand( JITTER_MIN, JITTER_MAX )
-        local jitter = Vector(
-            math.cos( math.rad( angle ) ) * dist,
-            math.sin( math.rad( angle ) ) * dist,
+        local ang  = math.Rand( 0, 360 )
+        local dist = math.Rand( JITTER_MIN, JITTER_MAX )
+        self.Target = self.Target + Vector(
+            math.cos( math.rad( ang ) ) * dist,
+            math.sin( math.rad( ang ) ) * dist,
             math.Rand( -150, 150 )
         )
-        self.Target = self.Target + jitter
     end
 
-    -- Invisible prop for exhaust trail
+    -- Invisible prop for exhaust trail particle
     local a = self:GetAngles()
     a:RotateAroundAxis( self:GetUp(), 180 )
     local prop = ents.Create( "prop_physics" )
@@ -187,8 +168,8 @@ end
 function ENT:PhysicsCollide( data, physobj )
     if self.Destroyed then return end
     if self.ActivatedAlmonds
-       and data.Speed > 450
-       and data.DeltaTime > 0.2 then
+       and data.Speed    > 200
+       and data.DeltaTime > 0.1 then
         self:MissileDoExplosion()
     end
 end
@@ -196,11 +177,8 @@ end
 -- ============================================================
 --  PhysicsUpdate  --  3-phase top-attack arc
 --
---  FIX PART 2:
---  Thrust uses PhysForward(phys) -- reads phys:GetAngles():Forward()
---  which reflects the orientation we JUST set this tick via
---  phys:SetAngles().  self:GetForward() lags one tick behind and
---  was the direct cause of the circles.
+--  Movement: SetVelocityInstantaneous() every tick so we fully
+--  own the trajectory. No force accumulation, no gravity fight.
 -- ============================================================
 function ENT:PhysicsUpdate()
     if not self.ActivatedAlmonds then return end
@@ -209,42 +187,43 @@ function ENT:PhysicsUpdate()
     local phys = self:GetPhysicsObject()
     if not IsValid( phys ) then return end
 
-    -- Speed ramp
-    if self:GetVelocity():Length() < SPEED_CAP then
-        self.SpeedValue = self.SpeedValue + 250
+    -- Speed ramp up to cap
+    if self.SpeedValue < SPEED_CAP then
+        self.SpeedValue = self.SpeedValue + SPEED_STEP
     end
 
-    -- 3-phase arc
-    local mp          = self:GetPos()
-    local _2dDistance = Vector( mp.x, mp.y, 0 ):Distance(
-                        Vector( self.Target.x, self.Target.y, 0 ) )
+    -- 3-phase arc steering
+    local mp = self:GetPos()
+    local _2dDist = Vector( mp.x, mp.y, 0 ):Distance(
+                    Vector( self.Target.x, self.Target.y, 0 ) )
 
     if not self.InitialDistance then
-        self.InitialDistance = _2dDistance
+        self.InitialDistance = math.max( _2dDist, 1 )
     end
 
     local halfway   = self.InitialDistance * 0.9
     local twoThirds = self.InitialDistance * 0.4
     local aimPos
 
-    if _2dDistance > halfway then
-        aimPos = self.Target + Vector( 0, 0, 512 )                             -- Phase 1: climb
-    elseif _2dDistance > twoThirds then
+    if _2dDist > halfway then
+        aimPos = self.Target + Vector( 0, 0, 512 )                        -- Phase 1: climb
+    elseif _2dDist > twoThirds then
         aimPos = self.Target + Vector( 0, 0,
-            math.Clamp( self.InitialDistance * 0.85, 0, 14500 ) )              -- Phase 2: apex
+            math.Clamp( self.InitialDistance * 0.85, 0, 14500 ) )         -- Phase 2: apex
     else
-        aimPos = self.Target                                                    -- Phase 3: dive
+        aimPos = self.Target                                               -- Phase 3: dive
     end
 
-    local lerpVal = _2dDistance < 1000 and 0.1 or 0.01
+    -- Steer physics body toward aim point
+    local lerpVal = _2dDist < 1000 and 0.12 or 0.02
     local wantAng = ( aimPos - mp ):GetNormalized():Angle()
     local newAng  = LerpAngle( lerpVal, phys:GetAngles(), wantAng )
 
     phys:SetAngles( newAng )
     phys:SetAngleVelocity( Vector( 0, 0, 0 ) )
 
-    -- FIX PART 2: use PhysForward, not self:GetForward()
-    phys:ApplyForceCenter( PhysForward( phys ) * self.SpeedValue )
+    -- Drive velocity directly -- no gravity, no force accumulation
+    phys:SetVelocityInstantaneous( PhysForward( phys ) * self.SpeedValue )
 end
 
 -- ============================================================
@@ -286,9 +265,8 @@ function ENT:MissileDoExplosion()
     sound.Play( SND_EXPLODE, pos, 100, 100 )
     util.ScreenShake( pos, 16, 200, 1, 3000 )
 
-    if util.EffectExists( "vj_explosion3" ) then
-        ParticleEffect( "vj_explosion3", pos, Angle( 0, 0, 0 ) )
-    end
+    -- FIX B: util.EffectExists does not exist -- use pcall instead
+    pcall( ParticleEffect, "vj_explosion3", pos, Angle( 0, 0, 0 ), nil )
 
     local ed = EffectData()
     ed:SetOrigin( pos )
